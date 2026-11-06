@@ -1,0 +1,78 @@
+# ==============================================================================
+# Git Ignore Rules for Gmail MCP Server
+# ==============================================================================
+
+# Credentials, tokens, secrets and environment variables (CRITICAL)
+.env
+.env.*
+*.env
+!.env.example
+credentials.json
+token.json
+client_secrets*.json
+*.pem
+*.key
+*.p12
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Byte-compiled / optimized / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# SQLite local databases and write-ahead logs
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.db-journal
+
+# Temporary download / export / attachment contents (preserve directory structures)
+data/downloads/*
+!data/downloads/.gitkeep
+data/exports/*
+!data/exports/.gitkeep
+attachments/*
+!attachments/.gitkeep
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Distribution and packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Editor and IDE metadata
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Workspace runs
+runs/
