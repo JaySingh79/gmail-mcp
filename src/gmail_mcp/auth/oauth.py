@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import Any
 
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -13,6 +14,34 @@ from googleapiclient.discovery import build
 from gmail_mcp.auth.credentials import DEFAULT_SCOPES
 from gmail_mcp.auth.token_manager import TokenManager
 from gmail_mcp.config import GmailConfig
+
+
+class _AuthUrlNotifier:
+    """Notifies the user and opens the browser via Windows shell when Google generates the OAuth URL."""
+
+    def __init__(self, callback_url_file: Path | None = None) -> None:
+        self.callback_url_file = callback_url_file
+
+    def format(self, url: str) -> str:
+        msg = (
+            f"\n=======================================================\n"
+            f"PLEASE VISIT THIS URL TO AUTHORIZE GMAIL MCP:\n{url}\n"
+            f"=======================================================\n"
+        )
+        sys.stdout.write(msg)
+        sys.stdout.flush()
+        if self.callback_url_file:
+            try:
+                self.callback_url_file.write_text(url, encoding="utf-8")
+            except Exception:
+                pass
+        try:
+            import os
+            if hasattr(os, "startfile"):
+                os.startfile(url)
+        except Exception:
+            pass
+        return msg
 
 
 class OAuthFlowManager:
@@ -51,6 +80,9 @@ class OAuthFlowManager:
                 "(Project 542762227233) and save it as 'credentials.json'."
             )
 
+        url_file = self.config.workspace_root / "data" / "pending_auth_url.txt"
+        notifier = _AuthUrlNotifier(callback_url_file=url_file)
+
         flow = InstalledAppFlow.from_client_secrets_file(
             str(self.config.credentials_path),
             scopes=target_scopes,
@@ -60,6 +92,7 @@ class OAuthFlowManager:
             access_type="offline",
             prompt="consent",
             open_browser=open_browser,
+            authorization_prompt_message=notifier,
         )
         self.token_manager.save_credentials(creds)
         profile = self.verify_with_get_profile()
@@ -89,9 +122,12 @@ def main() -> int:
     parser.add_argument("--force-reauth", action="store_true", help="Force new consent and refresh token")
     parser.add_argument("--status", action="store_true", help="Print current OAuth token & profile status")
     parser.add_argument("--port", type=int, default=0, help="Local loopback port (default: 0 / OS-assigned)")
+    parser.add_argument("--credentials-path", type=str, default=None, help="Path to client secrets JSON")
     args = parser.parse_args()
 
     config = GmailConfig()
+    if args.credentials_path:
+        config.credentials_path = Path(args.credentials_path).resolve()
     token_mgr = TokenManager(config)
     flow_mgr = OAuthFlowManager(config, token_mgr)
 

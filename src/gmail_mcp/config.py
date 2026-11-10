@@ -121,7 +121,7 @@ class GmailConfig(BaseModel):
     )
     api_version: str = "v1"
     cloud_project_number: str = Field(
-        default_factory=lambda: os.getenv("GMAIL_CLOUD_PROJECT_NUMBER", "542762227233")
+        default_factory=lambda: os.getenv("GMAIL_CLOUD_PROJECT_NUMBER", "187614359153")
     )
     cloud_project_created_before: str = "2026-05-01"
     legacy_quota_verified: bool = Field(
@@ -132,7 +132,7 @@ class GmailConfig(BaseModel):
     workspace_root: Path = Field(default=WORKSPACE_ROOT)
     credentials_path: Path = Field(
         default_factory=lambda: Path(
-            os.getenv("GMAIL_CREDENTIALS_PATH", str(WORKSPACE_ROOT / "credentials.json"))
+            os.getenv("GMAIL_CREDENTIALS_PATH", str(WORKSPACE_ROOT / "creds_mcp_agy copy.json"))
         )
     )
     token_path: Path = Field(

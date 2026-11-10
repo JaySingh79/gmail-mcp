@@ -8,8 +8,10 @@
 *.env
 !.env.example
 credentials.json
+*creds*.json
 token.json
 client_secrets*.json
+data/pending_auth_url.txt
 *.pem
 *.key
 *.p12
