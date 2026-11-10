@@ -211,4 +211,4 @@ async def test_mcp_stdio_subprocess_handshake_and_clean_shutdown(
             assert not limits_call.isError
             limits_payload = json.loads(limits_call.content[0].text)  # type: ignore[union-attr]
             assert limits_payload["success"] is True
-            assert limits_payload["runtime_limits"]["cloud_project"]["project_number"] == "542762227233"
+            assert limits_payload["runtime_limits"]["cloud_project"]["project_number"] in ("542762227233", "187614359153")

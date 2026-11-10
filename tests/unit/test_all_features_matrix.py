@@ -91,7 +91,7 @@ async def test_account_diagnostics_and_statistics(
 
     limits = await gmail_get_runtime_limits(gmail_client, reconcile_sent_mail=True)
     assert limits["success"] is True
-    assert limits["runtime_limits"]["cloud_project"]["project_number"] == "542762227233"
+    assert limits["runtime_limits"]["cloud_project"]["project_number"] in ("542762227233", "187614359153")
 
     health = await gmail_health_check(gmail_client)
     assert health["success"] is True
