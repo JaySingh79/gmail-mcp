@@ -16,11 +16,13 @@ def test_filesystem_path_traversal_and_outside_allowed_dir_blocked(
     gmail_client: GmailClientWrapper,
     temp_workspace: dict[str, Path],
 ) -> None:
-    """Verify path traversal ('..') and files outside allowed directories are strictly rejected."""
+    """Verify path traversal ('..') and files outside allowed directories are strictly rejected when sandbox is active."""
     with pytest.raises(SafetyError) as exc_traversal:
         gmail_client.safety.resolve_safe_path("../../.env", must_exist=False)
     assert exc_traversal.value.error_code == "PATH_TRAVERSAL_BLOCKED"
 
+    # When sandbox is strictly enforced, outside paths are rejected
+    gmail_client.config.allow_any_attachment_dir = False
     outside_file = temp_workspace["root"] / "secret_outside.txt"
     outside_file.write_text("do not attach", encoding="utf-8")
     with pytest.raises(SafetyError) as exc_outside:
@@ -30,6 +32,21 @@ def test_filesystem_path_traversal_and_outside_allowed_dir_blocked(
     with pytest.raises(SafetyError) as exc_missing:
         gmail_client.safety.validate_attachment_file(temp_workspace["attachments"] / "nonexistent.pdf")
     assert exc_missing.value.error_code == "ATTACHMENT_FILE_NOT_FOUND"
+
+
+def test_attachment_allowed_from_any_directory_by_default(
+    gmail_client: GmailClientWrapper,
+    temp_workspace: dict[str, Path],
+) -> None:
+    """Verify attachments can be attached from any directory by default."""
+    assert gmail_client.config.allow_any_attachment_dir is True
+    any_dir_file = temp_workspace["root"] / "arbitrary_custom_folder" / "external_resume.pdf"
+    any_dir_file.parent.mkdir(parents=True, exist_ok=True)
+    any_dir_file.write_text("dummy resume content", encoding="utf-8")
+
+    validated = gmail_client.safety.validate_attachment_file(any_dir_file)
+    assert validated["filename"] == "external_resume.pdf"
+    assert validated["size_bytes"] == len("dummy resume content")
 
 
 def test_attachment_size_ceiling_enforced(

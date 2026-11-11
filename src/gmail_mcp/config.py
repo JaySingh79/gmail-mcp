@@ -158,6 +158,12 @@ class GmailConfig(BaseModel):
             if d.strip()
         ]
     )
+    allow_any_attachment_dir: bool = Field(
+        default_factory=lambda: os.getenv("GMAIL_ALLOW_ANY_ATTACHMENT_DIR", "true").lower() in ("1", "true", "yes")
+    )
+    allow_any_dir: bool = Field(
+        default_factory=lambda: os.getenv("GMAIL_ALLOW_ANY_DIR", "false").lower() in ("1", "true", "yes")
+    )
 
     # Standard documented quota model (Section 7.A)
     project_quota_per_minute: int = Field(
@@ -264,4 +270,5 @@ class GmailConfig(BaseModel):
         """Ensure database parent directory and default allowed directories exist."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         for directory in self.allowed_dirs:
-            directory.mkdir(parents=True, exist_ok=True)
+            if str(directory) != "*" and getattr(directory, "name", "") != "*":
+                directory.mkdir(parents=True, exist_ok=True)

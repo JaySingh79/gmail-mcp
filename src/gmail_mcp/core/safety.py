@@ -133,6 +133,7 @@ class SafetyGuard:
         file_path: str | Path,
         must_exist: bool = True,
         allow_create_in_allowed_dir: bool = False,
+        is_attachment: bool = False,
     ) -> Path:
         """Resolve a path and enforce allowed-directory containment, path traversal protection, and symlink blocking."""
         raw_path = Path(file_path)
@@ -148,8 +149,13 @@ class SafetyGuard:
             candidates.append(raw_path)
         else:
             candidates.append(self.config.workspace_root / raw_path)
+            try:
+                candidates.append(Path.cwd() / raw_path)
+            except Exception:
+                pass
             for allowed in self.config.allowed_dirs:
-                candidates.append(allowed / raw_path)
+                if str(allowed) != "*" and getattr(allowed, "name", "") != "*":
+                    candidates.append(allowed / raw_path)
 
         chosen: Path | None = None
         for cand in candidates:
@@ -167,13 +173,28 @@ class SafetyGuard:
             )
 
         resolved = chosen.resolve()
-        allowed_resolved = [d.resolve() for d in self.config.allowed_dirs]
-        if not any(resolved == allowed_dir or allowed_dir in resolved.parents for allowed_dir in allowed_resolved):
-            raise SafetyError(
-                "PATH_OUTSIDE_ALLOWED_DIRS",
-                f"Path '{file_path}' resolves outside configured allowed directories.",
-                {"allowed_directories": [str(d) for d in allowed_resolved]},
-            )
+
+        # Check allowed directory boundary
+        skip_dir_check = False
+        if is_attachment and getattr(self.config, "allow_any_attachment_dir", True):
+            skip_dir_check = True
+        elif getattr(self.config, "allow_any_dir", False):
+            skip_dir_check = True
+        elif any(str(d) == "*" or getattr(d, "name", "") == "*" for d in self.config.allowed_dirs):
+            skip_dir_check = True
+
+        if not skip_dir_check:
+            allowed_resolved = [
+                d.resolve()
+                for d in self.config.allowed_dirs
+                if str(d) != "*" and getattr(d, "name", "") != "*"
+            ]
+            if not any(resolved == allowed_dir or allowed_dir in resolved.parents for allowed_dir in allowed_resolved):
+                raise SafetyError(
+                    "PATH_OUTSIDE_ALLOWED_DIRS",
+                    f"Path '{file_path}' resolves outside configured allowed directories.",
+                    {"allowed_directories": [str(d) for d in allowed_resolved]},
+                )
 
         if must_exist:
             if not resolved.exists() or not resolved.is_file():
@@ -193,7 +214,7 @@ class SafetyGuard:
 
     def validate_attachment_file(self, file_path: str | Path) -> dict[str, Any]:
         """Validate attachment existence, path safety, and raw file size."""
-        resolved = self.resolve_safe_path(file_path, must_exist=True)
+        resolved = self.resolve_safe_path(file_path, must_exist=True, is_attachment=True)
         size_bytes = resolved.stat().st_size
         if size_bytes > self.config.attachment_max_bytes:
             raise SafetyError(
