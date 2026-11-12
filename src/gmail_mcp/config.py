@@ -148,6 +148,14 @@ class GmailConfig(BaseModel):
             )
         )
     )
+    lock_path: Path = Field(
+        default_factory=lambda: Path(
+            os.getenv(
+                "GMAIL_LOCK_PATH",
+                str(WORKSPACE_ROOT / "data" / "gmail_mcp.lock"),
+            )
+        )
+    )
     allowed_dirs: list[Path] = Field(
         default_factory=lambda: [
             (WORKSPACE_ROOT / d.strip()).resolve()

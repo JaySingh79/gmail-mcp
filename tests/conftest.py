@@ -10,6 +10,7 @@ from email.message import EmailMessage
 from email.parser import BytesParser
 from pathlib import Path
 from typing import Any
+import uuid
 from unittest.mock import MagicMock
 
 import pytest
@@ -491,6 +492,21 @@ class MockGmailBackend:
                 raise make_http_error(404, "notFound", f"Draft {did} not found")
             self.drafts.pop(did, None)
             return {}
+
+        if method == "drafts.send":
+            body = params.get("body") or {}
+            did = body.get("id") or params.get("id")
+            if not did or did not in self.drafts:
+                raise make_http_error(404, "notFound", f"Draft {did} not found")
+            draft_rec = self.drafts.pop(did)
+            msg = dict(draft_rec.get("message") or {})
+            mid = msg.get("id") or f"m_{uuid.uuid4().hex[:8]}"
+            tid = msg.get("threadId") or f"t_{uuid.uuid4().hex[:8]}"
+            msg["id"] = mid
+            msg["threadId"] = tid
+            msg["labelIds"] = ["SENT"]
+            self.messages[mid] = msg
+            return {"id": mid, "threadId": tid, "labelIds": ["SENT"]}
 
         if method == "labels.list":
             return {"labels": list(self.labels.values())}

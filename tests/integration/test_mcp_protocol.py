@@ -40,12 +40,15 @@ MANDATORY_TOOLS = {
     "gmail_bulk_create_drafts",
     "gmail_bulk_attach_to_drafts",
     # D. Sending & replies
+    "gmail_send_draft",
     "gmail_send_email",
     "gmail_send_reply",
     "gmail_send_reply_all",
     "gmail_forward_message",
     "gmail_prepare_bulk_send",
     "gmail_execute_bulk_send",
+    "gmail_bulk_send_drafts",
+    "gmail_get_bulk_status",
     "gmail_prepare_bulk_reply",
     "gmail_execute_bulk_reply",
     # E. Templates

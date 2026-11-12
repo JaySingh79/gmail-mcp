@@ -1,4 +1,4 @@
-"""FastMCP server registration, lifespan dependency injection, and CLI entrypoint."""
+﻿"""FastMCP server registration, lifespan dependency injection, and CLI entrypoint."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ from gmail_mcp.tools import (
     gmail_bulk_attach_to_drafts,
     gmail_bulk_create_drafts,
     gmail_bulk_label_messages,
+    gmail_bulk_send_drafts,
     gmail_cancel_scheduled_send,
     gmail_create_draft,
     gmail_create_filter,
@@ -40,6 +41,7 @@ from gmail_mcp.tools import (
     gmail_export_messages,
     gmail_forward_message,
     gmail_get_attachment,
+    gmail_get_bulk_status,
     gmail_get_draft,
     gmail_get_filter,
     gmail_get_mailbox_settings,
@@ -66,6 +68,7 @@ from gmail_mcp.tools import (
     gmail_schedule_send,
     gmail_search_messages,
     gmail_search_threads,
+    gmail_send_draft,
     gmail_send_email,
     gmail_send_reply,
     gmail_send_reply_all,
@@ -114,7 +117,7 @@ def create_gmail_mcp_server(
 ) -> tuple[FastMCP, GmailClientWrapper]:
     """
     Create and configure the Gmail Automation FastMCP server with shared dependency injection.
-    All 57 tools share the same `GmailClientWrapper`, `QuotaManager`, `RateLimiter`, and `DatabaseManager`.
+    All 60 tools share the same `GmailClientWrapper`, `QuotaManager`, `RateLimiter`, and `DatabaseManager`.
     """
     shared_client = client or GmailClientWrapper(GmailConfig())
     scheduler_worker = ScheduledSendWorker(shared_client)
@@ -841,9 +844,21 @@ def create_gmail_mcp_server(
         annotations=WRITE_SAFE_ANNOTATIONS,
     )
     async def _tool_gmail_bulk_create_drafts(
-        recipients: list[dict[str, Any]] = Field(
-            ...,
+        recipients: list[dict[str, Any]] | None = Field(
+            default=None,
             description="List of recipient dictionaries, each containing 'to' (email string) and optional template variables (e.g. [{'to': 'a@b.com', 'name': 'Alice'}]).",
+        ),
+        recipient_source: str | None = Field(
+            default=None,
+            description="Optional CSV or JSON file path containing recipient or lead records.",
+        ),
+        field_mapping: dict[str, str] | None = Field(
+            default=None,
+            description="Optional dictionary mapping target template variables to source keys (e.g. {'email': 'Contact Email', 'company': 'Company Name'}).",
+        ),
+        attachment_pattern: str | None = Field(
+            default=None,
+            description="Optional attachment path template string (e.g. 'D:/Resumes/{company}_cover_letter.pdf') to attach per-recipient files.",
         ),
         template_id: str | None = Field(
             default=None,
@@ -865,15 +880,23 @@ def create_gmail_mcp_server(
             default=None,
             description="Common list of local file paths to attach to every created draft.",
         ),
+        compact: bool = Field(
+            default=True,
+            description="When True, returns a lightweight summary with created draft IDs and sample items, preventing context window bloating.",
+        ),
     ) -> dict[str, Any]:
         return await gmail_bulk_create_drafts(
             shared_client,
             recipients=recipients,
+            recipient_source=recipient_source,
+            field_mapping=field_mapping,
+            attachment_pattern=attachment_pattern,
             template_id=template_id,
             subject=subject,
             body_text=body_text,
             body_html=body_html,
             attachments=attachments,
+            compact=compact,
         )
 
     @mcp.tool(
@@ -907,8 +930,33 @@ def create_gmail_mcp_server(
         )
 
     # -------------------------------------------------------------------------
-    # D. Sending, Replying, and Forwarding (4 Tools)
+    # D. Sending, Replying, and Forwarding (5 Tools)
     # -------------------------------------------------------------------------
+
+    @mcp.tool(
+        name="gmail_send_draft",
+        description=(
+            "Dispatch an existing draft directly via Gmail API's native `users.drafts.send`. "
+            "Sends the staged draft immediately without re-rendering bodies or re-uploading attachments. "
+            "Records the sent email into the local SQLite ledger and cleans up the draft automatically."
+        ),
+        annotations=WRITE_SAFE_ANNOTATIONS,
+    )
+    async def _tool_gmail_send_draft(
+        draft_id: str = Field(
+            ...,
+            description="The unique Gmail draft ID to send (e.g. 'r-1234567890').",
+        ),
+        idempotency_key: str | None = Field(
+            default=None,
+            description="Optional unique token to prevent duplicate dispatch if re-executed.",
+        ),
+    ) -> dict[str, Any]:
+        return await gmail_send_draft(
+            shared_client,
+            draft_id=draft_id,
+            idempotency_key=idempotency_key,
+        )
 
     @mcp.tool(
         name="gmail_send_email",
@@ -1219,7 +1267,7 @@ def create_gmail_mcp_server(
         )
 
     # -------------------------------------------------------------------------
-    # E. Bulk Sending Workflows (Two-Phase) (4 Tools)
+    # E. Bulk Sending Workflows (Two-Phase) (6 Tools)
     # -------------------------------------------------------------------------
 
     @mcp.tool(
@@ -1227,6 +1275,7 @@ def create_gmail_mcp_server(
         description=(
             "Phase 1 of two-phase bulk sending: Validate recipient lists, render templates, estimate quota consumption, "
             "and create a staged sending plan in SQLite. "
+            "Supports arbitrary JSON/CSV lead sources with `field_mapping` and per-recipient `attachment_pattern`. "
             "Returns a unique `plan_id` and itemized preview. Does NOT send any emails. "
             "To execute the staged plan, call `gmail_execute_bulk_send` with the returned `plan_id`."
         ),
@@ -1239,7 +1288,15 @@ def create_gmail_mcp_server(
         ),
         recipient_source: str | None = Field(
             default=None,
-            description="Optional CSV file path containing recipient rows (columns mapped to template variables).",
+            description="Optional CSV or JSON file path containing recipient rows (columns mapped to template variables).",
+        ),
+        field_mapping: dict[str, str] | None = Field(
+            default=None,
+            description="Optional mapping from target fields (to, email, name, company) to source column/key names.",
+        ),
+        attachment_pattern: str | None = Field(
+            default=None,
+            description="Optional attachment path template string (e.g. 'D:/Resumes/{company}_cover_letter.pdf') for per-recipient attachments.",
         ),
         template_id: str | None = Field(
             default=None,
@@ -1273,11 +1330,17 @@ def create_gmail_mcp_server(
             default=False,
             description="When True, checks recent sent emails to verify daily quota headroom before planning.",
         ),
+        compact: bool = Field(
+            default=True,
+            description="When True, returns a compact preview summary with 2 sample items instead of large full-plan dumps.",
+        ),
     ) -> dict[str, Any]:
         return await gmail_prepare_bulk_send(
             shared_client,
             recipients=recipients,
             recipient_source=recipient_source,
+            field_mapping=field_mapping,
+            attachment_pattern=attachment_pattern,
             template_id=template_id,
             subject=subject,
             body_text=body_text,
@@ -1286,6 +1349,7 @@ def create_gmail_mcp_server(
             personalize=personalize,
             dry_run=dry_run,
             reconcile_sent_mail=reconcile_sent_mail,
+            compact=compact,
         )
 
     @mcp.tool(
@@ -1293,7 +1357,7 @@ def create_gmail_mcp_server(
         description=(
             "Phase 2 of two-phase bulk sending: Execute an approved bulk sending plan by its `plan_id`. "
             "Safety confirmation gate: Requires `confirmation_phrase='CONFIRM_SEND_<plan_id>'` to prevent accidental transmissions. "
-            "Executes sends sequentially with rate limiting, quota tracking, and error recovery."
+            "Executes sends concurrently with rate limiting, quota tracking, error recovery, and optional background execution."
         ),
         annotations=WRITE_SAFE_ANNOTATIONS,
     )
@@ -1310,12 +1374,81 @@ def create_gmail_mcp_server(
             default=None,
             description="Optional item overrides or modifications to apply to staged plan items before dispatch.",
         ),
+        concurrency: int = Field(
+            default=5,
+            description="Number of concurrent dispatch workers (1-10). Default is 5.",
+        ),
+        compact: bool = Field(
+            default=True,
+            description="When True, returns a compact execution summary instead of exhaustive individual result arrays.",
+        ),
+        run_async: bool = Field(
+            default=False,
+            description="When True, launches bulk sending in the background and returns a job_id for monitoring.",
+        ),
     ) -> dict[str, Any]:
         return await gmail_execute_bulk_send(
             shared_client,
             plan_id=plan_id,
             confirmation_phrase=confirmation_phrase,
             modified_items=modified_items,
+            concurrency=concurrency,
+            compact=compact,
+            run_async=run_async,
+        )
+
+    @mcp.tool(
+        name="gmail_bulk_send_drafts",
+        description=(
+            "Send a list of existing drafts directly using Gmail API's native `drafts.send` with parallel concurrency. "
+            "Ideal for dispatching drafts created with `gmail_bulk_create_drafts` after user review. "
+            "Supports concurrency (default 5 workers), compact return mode, and optional background execution (`run_async=True`)."
+        ),
+        annotations=WRITE_SAFE_ANNOTATIONS,
+    )
+    async def _tool_gmail_bulk_send_drafts(
+        draft_ids: list[str] = Field(
+            ...,
+            description="List of Gmail draft IDs to send.",
+        ),
+        concurrency: int = Field(
+            default=5,
+            description="Number of parallel dispatch workers (1-10). Default is 5.",
+        ),
+        compact: bool = Field(
+            default=True,
+            description="When True, returns compact summary metadata and sample items rather than exhaustive lists.",
+        ),
+        run_async: bool = Field(
+            default=False,
+            description="When True, spawns sending as a background task and returns a job_id immediately.",
+        ),
+    ) -> dict[str, Any]:
+        return await gmail_bulk_send_drafts(
+            shared_client,
+            draft_ids=draft_ids,
+            concurrency=concurrency,
+            compact=compact,
+            run_async=run_async,
+        )
+
+    @mcp.tool(
+        name="gmail_get_bulk_status",
+        description=(
+            "Check the real-time execution status and progress metrics of a background bulk send or draft send operation. "
+            "Returns status ('RUNNING', 'COMPLETED', 'PARTIAL_FAILURE', 'FAILED'), processed counts, sent/failed metrics, and elapsed time."
+        ),
+        annotations=READ_ONLY_ANNOTATIONS,
+    )
+    async def _tool_gmail_get_bulk_status(
+        job_id: str = Field(
+            ...,
+            description="The unique bulk job ID returned by `gmail_execute_bulk_send` or `gmail_bulk_send_drafts` when `run_async=True`.",
+        ),
+    ) -> dict[str, Any]:
+        return await gmail_get_bulk_status(
+            shared_client,
+            job_id=job_id,
         )
 
     @mcp.tool(
@@ -2306,7 +2439,7 @@ async def dump_schemas(target_dir: Path | str | None = None) -> list[str]:
     instructions_content = (
         "# Gmail Automation MCP Server Instructions\n\n"
         "Production-grade Gmail Automation MCP Server using official Gmail REST API v1.\n"
-        "Provides 57 fine-grained tools for search, retrieval, drafting, sending, templates, attachments, "
+        "Provides 60 fine-grained tools for search, retrieval, drafting, sending, templates, attachments, "
         "labels, mailbox settings, filters, and scheduling.\n\n"
         "## Key Workflow Patterns\n"
         "1. **Reconnaissance & Auth**: Use `gmail_get_profile` and `gmail_auth_status` to verify user and token readiness.\n"
@@ -2342,7 +2475,12 @@ def main() -> int:
         nargs="?",
         const="",
         default=None,
-        help="Export all 57 tool JSON schemas and instructions.md into target directory (default: ~/.gemini/antigravity-cli/mcp/gmail)",
+        help="Export all 60 tool JSON schemas and instructions.md into target directory (default: ~/.gemini/antigravity-cli/mcp/gmail)",
+    )
+    parser.add_argument(
+        "--ignore-lock",
+        action="store_true",
+        help="Bypass singleton server instance check (default: False)",
     )
     args = parser.parse_args()
 
@@ -2357,9 +2495,28 @@ def main() -> int:
         print(f"Exported {len(exported)} schema files successfully.")
         return 0
 
-    mcp, _ = create_gmail_mcp_server(start_scheduler=True)
-    mcp.run(transport=args.transport)
-    return 0
+    # Singleton instance guard: prevent multiple server processes
+    server_lock = None
+    if not args.ignore_lock:
+        from gmail_mcp.core.lock import SingleInstanceLock
+        server_lock = SingleInstanceLock()
+        if not server_lock.acquire(transport=args.transport):
+            info = server_lock.get_running_instance_info()
+            pid_str = f" (PID: {info.get('pid')}, started: {info.get('started_at')})" if info and "pid" in info else ""
+            sys.stderr.write(
+                f"[GMAIL_MCP_ERROR] Another instance of Gmail MCP Server is already running{pid_str}.\n"
+                f"Cannot launch multiple server instances simultaneously. Exiting.\n"
+            )
+            sys.stderr.flush()
+            return 1
+
+    try:
+        mcp, _ = create_gmail_mcp_server(start_scheduler=True)
+        mcp.run(transport=args.transport)
+        return 0
+    finally:
+        if server_lock:
+            server_lock.release()
 
 
 if __name__ == "__main__":

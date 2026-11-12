@@ -41,6 +41,8 @@ data/*.db
 data/*.db-wal
 data/*.db-shm
 data/*.db-journal
+data/*.lock
+data/*.pid
 
 # Temporary download / export / attachment contents (preserve directory structures)
 data/downloads/*

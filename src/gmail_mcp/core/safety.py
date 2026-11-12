@@ -16,7 +16,67 @@ logger = logging.getLogger("gmail_mcp.audit")
 EMAIL_REGEX = re.compile(
     r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$"
 )
-TEMPLATE_VAR_REGEX = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)(?:\|([^{}]*))?\s*\}\}")
+TEMPLATE_VAR_REGEX = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+KNOWN_TEMPLATE_FILTERS = {"first_name", "last_name", "title", "capitalize", "upper", "lower", "trim", "strip"}
+
+
+def parse_template_expression(raw_expr: str) -> tuple[str, list[str], str | None]:
+    """
+    Parse a template variable expression such as:
+      - 'recipient_name' -> ('recipient_name', [], None)
+      - 'recipient_name | first_name' -> ('recipient_name', ['first_name'], None)
+      - 'recipient_name | first_name | Hiring Manager' -> ('recipient_name', ['first_name'], 'Hiring Manager')
+      - 'recipient_name | default("Hiring Manager")' -> ('recipient_name', [], 'Hiring Manager')
+    Returns (var_name, filters_list, default_value).
+    """
+    parts = [p.strip() for p in raw_expr.split("|")]
+    var_name = parts[0]
+    filters: list[str] = []
+    default_val: str | None = None
+    for part in parts[1:]:
+        p_lower = part.lower()
+        if p_lower.startswith("default(") and part.endswith(")"):
+            default_val = part[8:-1].strip("'\" ")
+        elif p_lower.startswith("default:"):
+            default_val = part[8:].strip("'\" ")
+        elif p_lower in KNOWN_TEMPLATE_FILTERS:
+            filters.append(p_lower)
+        else:
+            default_val = part
+    return var_name, filters, default_val
+
+
+def apply_template_filters(value: str, filters: list[str]) -> str:
+    """Apply sequential string transformation filters to a template variable value."""
+    result = str(value)
+    for f in filters:
+        if f == "first_name":
+            if not result:
+                continue
+            words = result.strip().split()
+            salutations = {"mr", "mr.", "mrs", "mrs.", "ms", "ms.", "dr", "dr.", "prof", "prof.", "sir", "madam"}
+            filtered = [w for w in words if w.lower() not in salutations]
+            if not filtered:
+                filtered = words
+            result = filtered[0].capitalize()
+        elif f == "last_name":
+            if not result:
+                continue
+            words = result.strip().split()
+            salutations = {"mr", "mr.", "mrs", "mrs.", "ms", "ms.", "dr", "dr.", "prof", "prof.", "sir", "madam"}
+            filtered = [w for w in words if w.lower() not in salutations]
+            if not filtered:
+                filtered = words
+            result = filtered[-1].capitalize()
+        elif f in ("title", "capitalize"):
+            result = result.title() if f == "title" else result.capitalize()
+        elif f == "upper":
+            result = result.upper()
+        elif f == "lower":
+            result = result.lower()
+        elif f in ("trim", "strip"):
+            result = result.strip()
+    return result
 SENSITIVE_PATTERNS = [
     re.compile(r"ya29\.[A-Za-z0-9_\-]+"),
     re.compile(r"1//[A-Za-z0-9_\-]+"),
@@ -264,13 +324,12 @@ class SafetyGuard:
         body_text: str | None,
         body_html: str | None,
     ) -> tuple[list[str], dict[str, str]]:
-        """Extract variable names and inline default values (`{{var|default}}`) from template strings."""
+        """Extract variable names and inline default values (`{{var|default}}` or `{{var|filter|default}}`) from template strings."""
         vars_found: list[str] = []
         defaults: dict[str, str] = {}
         for content in (subject or "", body_text or "", body_html or ""):
             for match in TEMPLATE_VAR_REGEX.finditer(content):
-                var_name = match.group(1)
-                default_val = match.group(2)
+                var_name, _filters, default_val = parse_template_expression(match.group(1))
                 if var_name not in vars_found:
                     vars_found.append(var_name)
                 if default_val is not None:
@@ -287,7 +346,7 @@ class SafetyGuard:
         defaults: dict[str, str] | None = None,
         required_variables: list[str] | None = None,
     ) -> dict[str, str | None]:
-        """Render subject, plaintext, and HTML bodies while validating missing variables and escaping HTML."""
+        """Render subject, plaintext, and HTML bodies while validating missing variables, applying filters, and escaping HTML."""
         supplied = {k: v for k, v in (variables or {}).items() if v is not None}
         fallback = dict(defaults or {})
 
@@ -313,10 +372,9 @@ class SafetyGuard:
                 return None
 
             def _sub(match: re.Match[str]) -> str:
-                var_name = match.group(1)
-                inline_def = match.group(2)
+                var_name, filters, inline_def = parse_template_expression(match.group(1))
                 if var_name in supplied:
-                    raw_val = str(supplied[var_name])
+                    raw_val = apply_template_filters(str(supplied[var_name]), filters)
                 elif var_name in fallback:
                     raw_val = str(fallback[var_name])
                 elif inline_def is not None:

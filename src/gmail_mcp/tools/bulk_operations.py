@@ -8,25 +8,36 @@ from typing import Any
 from gmail_mcp.core.gmail_client import GmailClientWrapper
 from gmail_mcp.core.safety import SafetyError
 from gmail_mcp.tools.drafts import resolve_content_or_template
+from gmail_mcp.tools.sending import _load_recipient_records
 
 
 async def gmail_bulk_create_drafts(
     client: GmailClientWrapper,
-    recipients: list[dict[str, Any] | str],
+    recipients: list[dict[str, Any] | str] | None = None,
     *,
+    recipient_source: str | None = None,
+    field_mapping: dict[str, str] | None = None,
+    attachment_pattern: str | None = None,
     template_id: str | None = None,
     subject: str | None = None,
     body_text: str | None = None,
     body_html: str | None = None,
     attachments: list[str] | None = None,
+    compact: bool = True,
 ) -> dict[str, Any]:
     """
     Generate 1 to hundreds of drafts in a single logical operation from templates or recipient records.
     Supports per-recipient subjects, bodies, personalization variables, shared attachments, and individual attachments.
+    Also accepts `recipient_source` (path to scraped JSON/CSV), `field_mapping`, and `attachment_pattern`.
     """
     try:
-        if not recipients:
-            raise SafetyError("EMPTY_RECIPIENT_LIST", "`recipients` list cannot be empty.")
+        raw_recipients = _load_recipient_records(
+            client=client,
+            recipients=recipients,
+            recipient_source=recipient_source,
+            field_mapping=field_mapping,
+            attachment_pattern=attachment_pattern,
+        )
 
         shared_attachments = list(attachments or [])
         total_units = 0
@@ -34,7 +45,7 @@ async def gmail_bulk_create_drafts(
         failures_out: list[dict[str, Any]] = []
         safe_to_continue = True
 
-        for idx, item in enumerate(recipients):
+        for idx, item in enumerate(raw_recipients):
             if isinstance(item, str):
                 rec_dict: dict[str, Any] = {"email": item}
             elif isinstance(item, dict):
@@ -145,10 +156,33 @@ async def gmail_bulk_create_drafts(
                     safe_to_continue = False
                     break
 
-        requested_count = len(recipients)
+        requested_count = len(raw_recipients)
         created_count = len(drafts_out)
         failed_count = len(failures_out)
         skipped_count = max(0, requested_count - created_count - failed_count)
+        draft_ids = [d["draft_id"] for d in drafts_out if d.get("draft_id")]
+
+        if compact:
+            return {
+                "success": (created_count == requested_count and failed_count == 0),
+                "operation": "bulk_create_drafts",
+                "mutates_mailbox": True,
+                "requested": requested_count,
+                "successful": created_count,
+                "created": created_count,
+                "failed": failed_count,
+                "skipped": skipped_count,
+                "draft_ids": draft_ids,
+                "drafts": [{"draft_id": d["draft_id"], "recipient": d.get("recipient", "")} for d in drafts_out],
+                "sample_drafts": drafts_out[:3],
+                "sample_failures": failures_out[:5],
+                "safe_to_continue": safe_to_continue,
+                "compact": True,
+                "quota_estimate": {
+                    "units_per_request": 10,
+                    "total_units": total_units,
+                },
+            }
 
         return {
             "success": (created_count == requested_count and failed_count == 0),
@@ -159,11 +193,13 @@ async def gmail_bulk_create_drafts(
             "created": created_count,
             "failed": failed_count,
             "skipped": skipped_count,
+            "draft_ids": draft_ids,
             "drafts": drafts_out,
             "individual_results": drafts_out + failures_out,
             "retryable_failures": [f for f in failures_out if f.get("retryable")],
             "non_retryable_failures": [f for f in failures_out if not f.get("retryable")],
             "safe_to_continue": safe_to_continue,
+            "compact": False,
             "quota_estimate": {
                 "units_per_request": 10,
                 "total_units": total_units,

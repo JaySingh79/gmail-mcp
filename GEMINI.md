@@ -8,7 +8,7 @@
 
 ## 1. Executive Summary & Architecture Overview
 
-`gmail_mcp` is an enterprise-grade Model Context Protocol (MCP) server exposing **57 specialized tools** to LLM agents (Claude Code, Google Antigravity, Cursor, etc.) for autonomous Gmail management.
+`gmail_mcp` is an enterprise-grade Model Context Protocol (MCP) server exposing **60 specialized tools** to LLM agents (Claude Code, Google Antigravity, Cursor, etc.) for autonomous Gmail management.
 
 ### Architectural Philosophy
 1. **High Safety & Recipient Guardrails**: Rate-limiting token buckets, daily quota accounting, and blocklists prevent runaway loops from spamming or exhausting API limits.
@@ -102,6 +102,9 @@ To prevent LLM context bloat and token waste, **consult this routing guide befor
 - [`src/gmail_mcp/core/safety.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/core/safety.py):
   - **Purpose**: Validates email recipients against malicious patterns, checks domain blocklists, validates attachment file types/sizes, and resolves safe file paths (allows attachments from any directory via `allow_any_attachment_dir`).
   - **Read when**: Reviewing safety constraints or updating domain restrictions.
+- [`src/gmail_mcp/core/lock.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/core/lock.py):
+  - **Purpose**: Singleton server instance guard using OS-level non-blocking file locking (`msvcrt` on Windows, `fcntl` on Unix) and companion `.pid` metadata tracking. Prevents duplicate server processes from launching.
+  - **Read when**: Inspecting single-instance locking behavior or troubleshooting duplicate launch rejections.
 
 #### Local Storage & Repositories (`src/gmail_mcp/storage/`)
 - [`src/gmail_mcp/storage/database.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/storage/database.py):
@@ -121,7 +124,7 @@ To prevent LLM context bloat and token waste, **consult this routing guide befor
 
 ### C. Tool Implementations (`src/gmail_mcp/tools/`)
 
-All 57 tools are categorized across 14 dedicated modules:
+All 60 tools are categorized across 14 dedicated modules:
 
 | Module File | Exposed Tools | Description |
 | :--- | :--- | :--- |
@@ -131,8 +134,8 @@ All 57 tools are categorized across 14 dedicated modules:
 | [`tools/threads.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/threads.py) | `gmail_get_thread` | Retrieves an entire email conversation thread with chronological message tree. |
 | [`tools/search.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/search.py) | `gmail_search_messages`<br>`gmail_search_threads` | Executes Gmail search queries (`from:`, `has:attachment`, `after:`, `is:unread`) across messages/threads. |
 | [`tools/drafts.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/drafts.py) | `gmail_create_draft`<br>`gmail_get_draft`<br>`gmail_list_drafts`<br>`gmail_update_draft`<br>`gmail_delete_draft`<br>`gmail_duplicate_draft` | Full lifecycle management of Gmail drafts (create, view, edit, duplicate, remove). |
-| [`tools/sending.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/sending.py) | `gmail_send_email`<br>`gmail_send_reply`<br>`gmail_send_reply_all`<br>`gmail_forward_message` | Primary outbound sending tools with idempotency tokens and thread continuation. |
-| [`tools/bulk_operations.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/bulk_operations.py) | `gmail_bulk_create_drafts`<br>`gmail_bulk_attach_to_drafts`<br>`gmail_prepare_bulk_send`<br>`gmail_execute_bulk_send`<br>`gmail_prepare_bulk_reply`<br>`gmail_execute_bulk_reply` | Safe two-phase bulk operations (prepare plan -> human/agent verification -> execute send). |
+| [`tools/sending.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/sending.py) | `gmail_send_draft`<br>`gmail_send_email`<br>`gmail_send_reply`<br>`gmail_send_reply_all`<br>`gmail_forward_message`<br>`gmail_prepare_bulk_send`<br>`gmail_execute_bulk_send`<br>`gmail_bulk_send_drafts`<br>`gmail_get_bulk_status` | Primary outbound sending tools, draft dispatches, background jobs, and two-phase bulk campaigns. |
+| [`tools/bulk_operations.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/bulk_operations.py) | `gmail_bulk_create_drafts`<br>`gmail_bulk_attach_to_drafts`<br>`gmail_prepare_bulk_reply`<br>`gmail_execute_bulk_reply` | Bulk draft creation from scraped leads/JSON, bulk draft attachment injection, and bulk reply workflows. |
 | [`tools/attachments.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/attachments.py) | `gmail_get_attachment`<br>`gmail_list_attachments`<br>`gmail_attach_files_to_message` | Downloads attachments to disk, lists parts of an email, and attaches local files to existing drafts. |
 | [`tools/labels.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/labels.py) | `gmail_list_labels`<br>`gmail_create_label`<br>`gmail_update_label`<br>`gmail_delete_label`<br>`gmail_apply_label`<br>`gmail_remove_label` | Full management of user labels (create, rename, delete, apply, remove from messages). |
 | [`tools/filters.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/filters.py) | `gmail_list_filters`<br>`gmail_get_filter`<br>`gmail_create_filter`<br>`gmail_delete_filter` | Manages automated inbox filters (criteria: from, subject; actions: archive, label, star). |
