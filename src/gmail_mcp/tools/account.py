@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from gmail_mcp.auth.oauth import OAuthFlowManager
 from gmail_mcp.core.gmail_client import GmailClientWrapper
 
 SYSTEM_STATS_LABELS = [
@@ -70,7 +71,7 @@ async def gmail_auth_status(
         limits = client.quota_manager.get_runtime_limits_report()
         warnings.extend(limits["locally_measured_usage"]["sending_headroom"].get("warnings", []))
 
-        return {
+        out: dict[str, Any] = {
             "success": True,
             "operation": "gmail_auth_status",
             "mutates_mailbox": False,
@@ -96,8 +97,156 @@ async def gmail_auth_status(
                 "total_units": 1 if (report.authenticated and verify_connectivity) else 0,
             },
         }
+        if not report.authenticated:
+            out["action_required"] = report.action_required or "authenticate"
+            out["suggested_tool"] = report.suggested_tool or "gmail_authenticate"
+            out["suggested_arguments"] = report.suggested_arguments or {"force_reauth": False}
+        return out
     except Exception as exc:
         return client.format_tool_error("gmail_auth_status", exc, mutates_mailbox=False)
+
+
+async def gmail_authenticate(
+    client: GmailClientWrapper,
+    force_reauth: bool = False,
+    open_browser: bool = True,
+    timeout_seconds: int = 120,
+    scopes: list[str] | None = None,
+) -> dict[str, Any]:
+    """Execute OAuth 2.0 authorization or reuse existing valid authentication tokens."""
+    try:
+        # Fast path: check if already authenticated with all default scopes
+        if not force_reauth:
+            status = client.token_manager.get_auth_status(auto_refresh=True)
+            if status.authenticated and not status.missing_default_scopes:
+                try:
+                    profile, meta = await client.get_profile(tool_name="gmail_authenticate")
+                    return {
+                        "success": True,
+                        "operation": "gmail_authenticate",
+                        "mutates_mailbox": False,
+                        "status": "already_authenticated",
+                        "message": f"Already authenticated as {profile.get('emailAddress')}.",
+                        "email_address": profile.get("emailAddress"),
+                        "history_id": str(profile.get("historyId") or ""),
+                        "messages_total": int(profile.get("messagesTotal") or 0),
+                        "threads_total": int(profile.get("threadsTotal") or 0),
+                        "scopes": status.granted_scopes,
+                        "reused_existing_token": True,
+                        "quota_estimate": {
+                            "units_per_request": 1,
+                            "total_units": meta.get("quota_estimate", 1),
+                        },
+                    }
+                except Exception:
+                    # If get_profile fails despite status saying authenticated, fall through to re-auth
+                    pass
+
+        # Verify client secret credentials file existence
+        if not client.config.credentials_path.exists():
+            from gmail_mcp.config import resolve_credentials_path
+            resolved = resolve_credentials_path(workspace_root=client.config.workspace_root)
+            if resolved.exists():
+                client.config.credentials_path = resolved
+
+        if not client.config.credentials_path.exists():
+            return {
+                "success": False,
+                "operation": "gmail_authenticate",
+                "mutates_mailbox": False,
+                "error_code": "CREDENTIALS_FILE_MISSING",
+                "message": (
+                    f"OAuth client secrets file not found at '{client.config.credentials_path}'. "
+                    "Please ensure credentials.json or creds_mcp_agy.json exists in workspace root."
+                ),
+                "resolution_steps": [
+                    "Download your Desktop App OAuth 2.0 Client ID JSON from Google Cloud Console.",
+                    f"Save it as '{client.config.credentials_path.name}' in '{client.config.workspace_root}'.",
+                ],
+            }
+
+        flow_mgr = OAuthFlowManager(client.config, client.token_manager)
+
+        def _run_login() -> dict[str, Any]:
+            return flow_mgr.run_interactive_login(
+                scopes=scopes,
+                force_reauth=force_reauth,
+                open_browser=open_browser,
+            )
+
+        try:
+            login_result = await asyncio.wait_for(
+                asyncio.to_thread(_run_login),
+                timeout=timeout_seconds,
+            )
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            url_file = client.config.workspace_root / "data" / "pending_auth_url.txt"
+            if url_file.exists():
+                try:
+                    url_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            return {
+                "success": False,
+                "operation": "gmail_authenticate",
+                "mutates_mailbox": False,
+                "error_code": "AUTH_CANCELLED",
+                "message": "Authentication flow was cancelled by the user (KeyboardInterrupt).",
+                "resolution_steps": [
+                    "Call gmail_authenticate() again whenever you are ready to log in.",
+                ],
+            }
+        except asyncio.TimeoutError:
+            pending_url = None
+            url_file = client.config.workspace_root / "data" / "pending_auth_url.txt"
+            if url_file.exists():
+                try:
+                    pending_url = url_file.read_text(encoding="utf-8").strip()
+                except Exception:
+                    pass
+            return {
+                "success": False,
+                "operation": "gmail_authenticate",
+                "mutates_mailbox": False,
+                "error_code": "AUTH_TIMEOUT",
+                "message": (
+                    f"Authentication flow timed out after {timeout_seconds} seconds waiting for user browser consent."
+                ),
+                "pending_auth_url": pending_url,
+                "resolution_steps": [
+                    "Open the authorization URL manually in your browser if not opened automatically.",
+                    "Complete Google account selection and grant requested permissions.",
+                    "Call gmail_authenticate() again once ready.",
+                ],
+            }
+
+        # Invalidate in-memory caches and thread-local service
+        client.token_manager.clear_cached_credentials()
+        client.invalidate_metadata_cache()
+        if hasattr(client, "_thread_local"):
+            client._thread_local.gmail_service = None
+
+        # Verify connectivity and get mailbox profile
+        profile, meta = await client.get_profile(tool_name="gmail_authenticate")
+        return {
+            "success": True,
+            "operation": "gmail_authenticate",
+            "mutates_mailbox": False,
+            "status": "authenticated",
+            "message": f"Successfully authenticated as {profile.get('emailAddress')}.",
+            "email_address": profile.get("emailAddress"),
+            "history_id": str(profile.get("historyId") or ""),
+            "messages_total": int(profile.get("messagesTotal") or 0),
+            "threads_total": int(profile.get("threadsTotal") or 0),
+            "scopes": client.token_manager.get_granted_scopes(),
+            "reused_existing_token": login_result.get("reused_existing_token", False),
+            "quota_estimate": {
+                "units_per_request": 1,
+                "total_units": meta.get("quota_estimate", 1),
+            },
+        }
+    except Exception as exc:
+        return client.format_tool_error("gmail_authenticate", exc, mutates_mailbox=False)
 
 
 async def gmail_get_runtime_limits(

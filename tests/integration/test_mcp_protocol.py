@@ -17,6 +17,7 @@ from tests.conftest import MockGmailBackend
 
 MANDATORY_TOOLS = {
     # A. Account & diagnostics
+    "gmail_authenticate",
     "gmail_get_profile",
     "gmail_auth_status",
     "gmail_get_runtime_limits",
@@ -186,12 +187,13 @@ async def test_mcp_stdio_subprocess_handshake_and_clean_shutdown(
     """Spawn the actual MCP server over STDIO transport using `stdio_client`, verify handshake, tool listing, and call."""
     params = StdioServerParameters(
         command=sys.executable,
-        args=["-m", "gmail_mcp.server"],
+        args=["-m", "gmail_mcp.server", "--ignore-lock"],
         env={
             "GMAIL_DB_PATH": str(temp_workspace["root"] / "stdio_test.db"),
             "GMAIL_TOKEN_PATH": str(temp_workspace["root"] / "nonexistent_token.json"),
             "GMAIL_CREDENTIALS_PATH": str(temp_workspace["root"] / "credentials.json"),
             "GMAIL_ALLOWED_DIRS": str(temp_workspace["attachments"]),
+            "GMAIL_LOCK_PATH": str(temp_workspace["root"] / "stdio_test.lock"),
         },
     )
     async with stdio_client(params) as (read_stream, write_stream):

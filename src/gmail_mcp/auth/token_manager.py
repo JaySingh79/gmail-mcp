@@ -37,6 +37,9 @@ class AuthStatusReport(BaseModel):
     status_code: str
     message: str
     reauthorization_steps: list[str] = Field(default_factory=list)
+    action_required: str | None = None
+    suggested_tool: str | None = None
+    suggested_arguments: dict[str, Any] | None = None
 
 
 class TokenManager:
@@ -48,10 +51,24 @@ class TokenManager:
 
     @property
     def token_path(self) -> Path:
+        if self.config.token_path.exists():
+            return self.config.token_path
+        from gmail_mcp.config import WORKSPACE_ROOT, resolve_token_path
+        if self.config.workspace_root == WORKSPACE_ROOT:
+            resolved = resolve_token_path(workspace_root=self.config.workspace_root)
+            if resolved.exists():
+                self.config.token_path = resolved
         return self.config.token_path
 
     @property
     def credentials_path(self) -> Path:
+        if self.config.credentials_path.exists():
+            return self.config.credentials_path
+        from gmail_mcp.config import WORKSPACE_ROOT, resolve_credentials_path
+        if self.config.workspace_root == WORKSPACE_ROOT:
+            resolved = resolve_credentials_path(workspace_root=self.config.workspace_root)
+            if resolved.exists():
+                self.config.credentials_path = resolved
         return self.config.credentials_path
 
     def load_credentials(self, auto_refresh: bool = True) -> Credentials | None:
@@ -79,7 +96,8 @@ class TokenManager:
                 self._credentials = None
                 raise PermissionError(
                     "OAuth refresh token has expired or been revoked. Reauthorization is required: "
-                    "run `uv run --no-project python -m gmail_mcp.auth.oauth --login --force-reauth`."
+                    "call tool `gmail_authenticate(force_reauth=True)` or run "
+                    "`uv run --no-project python -m gmail_mcp.auth.oauth --login --force-reauth`."
                 ) from exc
 
         self._credentials = creds
@@ -160,7 +178,11 @@ class TokenManager:
                 reauthorization_steps=[
                     f"1. Verify OAuth client credentials exist at {self.credentials_path.name}.",
                     "2. Run: uv run --no-project python -m gmail_mcp.auth.oauth --login",
+                    "3. Or call tool: gmail_authenticate(force_reauth=False)",
                 ],
+                action_required="authenticate",
+                suggested_tool="gmail_authenticate",
+                suggested_arguments={"force_reauth": False},
             )
 
         try:
@@ -176,9 +198,13 @@ class TokenManager:
                 status_code="TOKEN_REVOKED_OR_EXPIRED",
                 message=str(exc),
                 reauthorization_steps=[
-                    "1. Run: uv run --no-project python -m gmail_mcp.auth.oauth --login --force-reauth",
-                    "2. Complete browser consent to generate a fresh refresh token.",
+                    "1. Call tool: gmail_authenticate(force_reauth=True)",
+                    "2. Or run: uv run --no-project python -m gmail_mcp.auth.oauth --login --force-reauth",
+                    "3. Complete browser consent to generate a fresh refresh token.",
                 ],
+                action_required="reauthenticate",
+                suggested_tool="gmail_authenticate",
+                suggested_arguments={"force_reauth": True},
             )
         except Exception as exc:
             return AuthStatusReport(
@@ -188,8 +214,12 @@ class TokenManager:
                 status_code="TOKEN_INVALID",
                 message=f"Unable to load OAuth token: {type(exc).__name__}",
                 reauthorization_steps=[
-                    "1. Run: uv run --no-project python -m gmail_mcp.auth.oauth --login --force-reauth"
+                    "1. Call tool: gmail_authenticate(force_reauth=True)",
+                    "2. Or run: uv run --no-project python -m gmail_mcp.auth.oauth --login --force-reauth",
                 ],
+                action_required="reauthenticate",
+                suggested_tool="gmail_authenticate",
+                suggested_arguments={"force_reauth": True},
             )
 
         if creds is None:
@@ -199,6 +229,13 @@ class TokenManager:
                 credentials_file_exists=creds_exists,
                 status_code="TOKEN_MISSING",
                 message="No OAuth credentials loaded.",
+                reauthorization_steps=[
+                    "1. Call tool: gmail_authenticate(force_reauth=False)",
+                    "2. Or run: uv run --no-project python -m gmail_mcp.auth.oauth --login",
+                ],
+                action_required="authenticate",
+                suggested_tool="gmail_authenticate",
+                suggested_arguments={"force_reauth": False},
             )
 
         granted = self.get_granted_scopes()
@@ -241,9 +278,13 @@ class TokenManager:
             ),
             reauthorization_steps=(
                 [
-                    "Run: uv run --no-project python -m gmail_mcp.auth.oauth --login --force-reauth"
+                    "1. Call tool: gmail_authenticate(force_reauth=True)",
+                    "2. Or run: uv run --no-project python -m gmail_mcp.auth.oauth --login --force-reauth",
                 ]
                 if (not is_valid or missing)
                 else []
             ),
+            action_required="reauthenticate" if not is_valid else None,
+            suggested_tool="gmail_authenticate" if not is_valid else None,
+            suggested_arguments={"force_reauth": True} if not is_valid else None,
         )

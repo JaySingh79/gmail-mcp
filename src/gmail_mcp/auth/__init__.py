@@ -7,7 +7,6 @@ from gmail_mcp.auth.credentials import (
     TOOL_SCOPE_REQUIREMENTS,
     build_insufficient_scope_report,
 )
-from gmail_mcp.auth.oauth import OAuthFlowManager
 from gmail_mcp.auth.token_manager import AuthStatusReport, TokenManager
 
 __all__ = [
@@ -20,3 +19,11 @@ __all__ = [
     "TokenManager",
     "build_insufficient_scope_report",
 ]
+
+
+def __getattr__(name: str):
+    if name == "OAuthFlowManager":
+        from gmail_mcp.auth.oauth import OAuthFlowManager
+
+        return OAuthFlowManager
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

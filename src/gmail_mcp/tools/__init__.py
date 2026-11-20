@@ -2,6 +2,7 @@
 
 from gmail_mcp.tools.account import (
     gmail_auth_status,
+    gmail_authenticate,
     gmail_get_mailbox_stats,
     gmail_get_profile,
     gmail_get_runtime_limits,
@@ -91,6 +92,7 @@ __all__ = [
     "gmail_apply_label",
     "gmail_attach_files_to_message",
     "gmail_auth_status",
+    "gmail_authenticate",
     "gmail_bulk_attach_to_drafts",
     "gmail_bulk_create_drafts",
     "gmail_bulk_label_messages",

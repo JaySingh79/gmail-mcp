@@ -103,6 +103,9 @@ class RetryManager:
                     retryable=False,
                     details={
                         "reason": reason,
+                        "action_required": "reauthenticate",
+                        "suggested_tool": "gmail_authenticate",
+                        "suggested_arguments": {"force_reauth": True},
                         "reauthorization_command": "uv run --no-project python -m gmail_mcp.auth.oauth --login --force-reauth",
                     },
                 )

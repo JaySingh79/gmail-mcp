@@ -89,10 +89,15 @@ class GmailClientWrapper:
                 "AUTH_NOT_CONFIGURED",
                 (
                     f"Valid OAuth credentials not found at '{self.config.token_path.name}'. "
-                    "Authenticate first via `uv run --no-project python -m gmail_mcp.auth.oauth --login`."
+                    "Gmail MCP is not authenticated. Call the 'gmail_authenticate' tool to authenticate."
                 ),
                 http_status=401,
                 retryable=False,
+                details={
+                    "action_required": "authenticate",
+                    "suggested_tool": "gmail_authenticate",
+                    "suggested_arguments": {"force_reauth": False},
+                },
             )
         service = getattr(self._thread_local, "gmail_service", None)
         cached_token = getattr(self._thread_local, "access_token", None)
@@ -131,18 +136,43 @@ class GmailClientWrapper:
         op_id = f"req_{uuid.uuid4().hex[:12]}"
         start_t = time.perf_counter()
 
+        # Check authentication readiness before executing API method
+        creds = self.token_manager.load_credentials(auto_refresh=True)
+        if creds is None or not creds.valid:
+            raise GmailMCPError(
+                "AUTH_NOT_CONFIGURED",
+                (
+                    f"Valid OAuth credentials not found at '{self.config.token_path.name}'. "
+                    "Gmail MCP is not authenticated. Call the 'gmail_authenticate' tool to authenticate."
+                ),
+                http_status=401,
+                retryable=False,
+                details={
+                    "token_path": str(self.config.token_path),
+                    "credentials_path": str(self.config.credentials_path),
+                    "action_required": "authenticate",
+                    "suggested_tool": "gmail_authenticate",
+                    "suggested_arguments": {"force_reauth": False},
+                },
+            )
+
         # Pre-flight scope check when token is present
         require_full = method in ("messages.delete", "threads.delete", "messages.batchDelete")
         has_scope, scope_err = self.token_manager.has_scope_for_tool(
             tool_name, require_full_access=require_full
         )
         if not has_scope and scope_err is not None:
+            scope_details = dict(scope_err)
+            scope_details["action_required"] = "reauthenticate"
+            scope_details["suggested_tool"] = "gmail_authenticate"
+            scope_details["suggested_arguments"] = {"force_reauth": True}
             raise GmailMCPError(
                 "INSUFFICIENT_SCOPE",
-                f"Missing required OAuth scope '{scope_err['missing_scope']}' for tool '{tool_name}'.",
+                f"Missing required OAuth scope '{scope_err['missing_scope']}' for tool '{tool_name}'. "
+                "Call the 'gmail_authenticate' tool with force_reauth=True to grant required scopes.",
                 http_status=403,
                 retryable=False,
-                details=scope_err,
+                details=scope_details,
             )
 
         consumed_units = 0
@@ -452,7 +482,7 @@ class GmailClientWrapper:
     def format_tool_error(operation: str, exc: Exception, mutates_mailbox: bool = False) -> dict[str, Any]:
         """Format any exception into the standardized MCP tool failure contract."""
         if isinstance(exc, GmailMCPError):
-            return {
+            out: dict[str, Any] = {
                 "success": False,
                 "operation": operation,
                 "mutates_mailbox": mutates_mailbox,
@@ -461,6 +491,32 @@ class GmailClientWrapper:
                 "http_status": exc.http_status,
                 "retryable": exc.retryable,
                 "details": exc.details,
+            }
+            if isinstance(exc.details, dict):
+                if "action_required" in exc.details:
+                    out["action_required"] = exc.details["action_required"]
+                if "suggested_tool" in exc.details:
+                    out["suggested_tool"] = exc.details["suggested_tool"]
+                if "suggested_arguments" in exc.details:
+                    out["suggested_arguments"] = exc.details["suggested_arguments"]
+            return out
+        if isinstance(exc, PermissionError) and ("OAuth" in str(exc) or "reauthorization" in str(exc).lower() or "token" in str(exc).lower()):
+            return {
+                "success": False,
+                "operation": operation,
+                "mutates_mailbox": mutates_mailbox,
+                "error_code": "AUTH_REAUTHORIZATION_REQUIRED",
+                "message": str(exc),
+                "action_required": "authenticate",
+                "suggested_tool": "gmail_authenticate",
+                "suggested_arguments": {"force_reauth": True},
+                "http_status": 401,
+                "retryable": False,
+                "details": {
+                    "action_required": "authenticate",
+                    "suggested_tool": "gmail_authenticate",
+                    "reason": "OAuth refresh token has expired or been revoked.",
+                },
             }
         if isinstance(exc, QuotaExhaustedError):
             return {

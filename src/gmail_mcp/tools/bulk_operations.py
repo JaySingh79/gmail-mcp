@@ -24,10 +24,12 @@ async def gmail_bulk_create_drafts(
     body_html: str | None = None,
     attachments: list[str] | None = None,
     compact: bool = True,
+    concurrency: int = 10,
 ) -> dict[str, Any]:
     """
-    Generate 1 to hundreds of drafts in a single logical operation from templates or recipient records.
-    Supports per-recipient subjects, bodies, personalization variables, shared attachments, and individual attachments.
+    Generate 1 to hundreds of drafts concurrently in parallel processing mode from templates or recipient records.
+    Supports per-recipient subjects, bodies, personalization variables, shared attachments, individual attachments,
+    and configurable parallel worker concurrency with automatic rate limiting and quota protection.
     Also accepts `recipient_source` (path to scraped JSON/CSV), `field_mapping`, and `attachment_pattern`.
     """
     try:
@@ -40,28 +42,51 @@ async def gmail_bulk_create_drafts(
         )
 
         shared_attachments = list(attachments or [])
+        step = max(1, min(int(concurrency), 25))
+        sem = asyncio.Semaphore(step)
+        lock = asyncio.Lock()
+
         total_units = 0
         drafts_out: list[dict[str, Any]] = []
         failures_out: list[dict[str, Any]] = []
         safe_to_continue = True
 
-        for idx, item in enumerate(raw_recipients):
+        reserved_keys = {
+            "email",
+            "to",
+            "cc",
+            "bcc",
+            "template_id",
+            "subject",
+            "body_text",
+            "body_html",
+            "attachments",
+            "variables",
+            "thread_id",
+        }
+
+        async def _create_one(idx: int, item: Any) -> None:
+            nonlocal safe_to_continue, total_units
+            if not safe_to_continue:
+                return
+
             if isinstance(item, str):
                 rec_dict: dict[str, Any] = {"email": item}
             elif isinstance(item, dict):
                 rec_dict = dict(item)
             else:
-                failures_out.append(
-                    {
-                        "index": idx,
-                        "recipient": str(item),
-                        "status": "failed",
-                        "error_code": "INVALID_RECIPIENT_RECORD",
-                        "message": "Recipient entry must be an email string or dictionary.",
-                        "retryable": False,
-                    }
-                )
-                continue
+                async with lock:
+                    failures_out.append(
+                        {
+                            "index": idx,
+                            "recipient": str(item),
+                            "status": "failed",
+                            "error_code": "INVALID_RECIPIENT_RECORD",
+                            "message": "Recipient entry must be an email string or dictionary.",
+                            "retryable": False,
+                        }
+                    )
+                return
 
             to_addr = rec_dict.get("email") or rec_dict.get("to")
             cc_addr = rec_dict.get("cc")
@@ -72,59 +97,47 @@ async def gmail_bulk_create_drafts(
             item_html = rec_dict.get("body_html") if rec_dict.get("body_html") is not None else body_html
             item_atts = list(dict.fromkeys(shared_attachments + list(rec_dict.get("attachments") or [])))
 
-            # Collect personalization variables from top-level keys + nested `variables`
-            reserved_keys = {
-                "email",
-                "to",
-                "cc",
-                "bcc",
-                "template_id",
-                "subject",
-                "body_text",
-                "body_html",
-                "attachments",
-                "variables",
-                "thread_id",
-            }
             vars_map: dict[str, Any] = {
                 k: v for k, v in rec_dict.items() if k not in reserved_keys
             }
             if isinstance(rec_dict.get("variables"), dict):
                 vars_map.update(rec_dict["variables"])
 
-            try:
-                resolved = resolve_content_or_template(
-                    client,
-                    subject=item_subj,
-                    body_text=item_text,
-                    body_html=item_html,
-                    template_id=item_tpl,
-                    variables=vars_map,
-                    attachments=item_atts,
-                )
-                built = client.mime_builder.build_email_message(
-                    to=to_addr,
-                    cc=cc_addr,
-                    bcc=bcc_addr,
-                    subject=resolved["subject"],
-                    body_text=resolved["body_text"],
-                    body_html=resolved["body_html"],
-                    attachments=resolved["attachments"],
-                )
-                body_payload: dict[str, Any] = {"message": {"raw": built["raw"]}}
-                if rec_dict.get("thread_id"):
-                    body_payload["message"]["threadId"] = rec_dict["thread_id"]
+            async with sem:
+                if not safe_to_continue:
+                    return
+                try:
+                    resolved = resolve_content_or_template(
+                        client,
+                        subject=item_subj,
+                        body_text=item_text,
+                        body_html=item_html,
+                        template_id=item_tpl,
+                        variables=vars_map,
+                        attachments=item_atts,
+                    )
+                    built = client.mime_builder.build_email_message(
+                        to=to_addr,
+                        cc=cc_addr,
+                        bcc=bcc_addr,
+                        subject=resolved["subject"],
+                        body_text=resolved["body_text"],
+                        body_html=resolved["body_html"],
+                        attachments=resolved["attachments"],
+                    )
+                    body_payload: dict[str, Any] = {"message": {"raw": built["raw"]}}
+                    if rec_dict.get("thread_id"):
+                        body_payload["message"]["threadId"] = rec_dict["thread_id"]
 
-                resp, meta = await client.execute_api(
-                    "drafts.create",
-                    {"body": body_payload},
-                    tool_name="gmail_bulk_create_drafts",
-                    op_class="write",
-                    attachment_bytes=built["raw_mime_size_bytes"],
-                )
-                total_units += int(meta.get("quota_estimate", 10))
-                drafts_out.append(
-                    {
+                    resp, meta = await client.execute_api(
+                        "drafts.create",
+                        {"body": body_payload},
+                        tool_name="gmail_bulk_create_drafts",
+                        op_class="write",
+                        attachment_bytes=built["raw_mime_size_bytes"],
+                    )
+                    units_consumed = int(meta.get("quota_estimate", 10))
+                    item_draft = {
                         "index": idx,
                         "draft_id": resp.get("id"),
                         "message_id": (resp.get("message") or {}).get("id"),
@@ -133,11 +146,12 @@ async def gmail_bulk_create_drafts(
                         "attachment_count": len(built["attachments"]),
                         "status": "created",
                     }
-                )
-            except Exception as item_exc:
-                err = client.format_tool_error("gmail_bulk_create_drafts", item_exc, mutates_mailbox=True)
-                failures_out.append(
-                    {
+                    async with lock:
+                        total_units += units_consumed
+                        drafts_out.append(item_draft)
+                except Exception as item_exc:
+                    err = client.format_tool_error("gmail_bulk_create_drafts", item_exc, mutates_mailbox=True)
+                    item_failure = {
                         "index": idx,
                         "recipient": str(to_addr or ""),
                         "status": "failed",
@@ -145,16 +159,24 @@ async def gmail_bulk_create_drafts(
                         "message": err["message"],
                         "retryable": err["retryable"],
                     }
-                )
-                if err["error_code"] in (
-                    "QUOTA_EXHAUSTED",
-                    "USER_RATE_LIMIT_HEADROOM_EXCEEDED",
-                    "PROJECT_RATE_LIMIT_HEADROOM_EXCEEDED",
-                    "INSUFFICIENT_SCOPE",
-                    "AUTH_REAUTHORIZATION_REQUIRED",
-                ):
-                    safe_to_continue = False
-                    break
+                    async with lock:
+                        failures_out.append(item_failure)
+                        if err["error_code"] in (
+                            "QUOTA_EXHAUSTED",
+                            "USER_RATE_LIMIT_HEADROOM_EXCEEDED",
+                            "PROJECT_RATE_LIMIT_HEADROOM_EXCEEDED",
+                            "INSUFFICIENT_SCOPE",
+                            "AUTH_REAUTHORIZATION_REQUIRED",
+                        ):
+                            safe_to_continue = False
+
+        await asyncio.gather(
+            *[_create_one(idx, item) for idx, item in enumerate(raw_recipients)],
+            return_exceptions=False,
+        )
+
+        drafts_out.sort(key=lambda d: d["index"])
+        failures_out.sort(key=lambda f: f["index"])
 
         requested_count = len(raw_recipients)
         created_count = len(drafts_out)
@@ -172,6 +194,7 @@ async def gmail_bulk_create_drafts(
                 "created": created_count,
                 "failed": failed_count,
                 "skipped": skipped_count,
+                "concurrency_used": step,
                 "draft_ids": draft_ids,
                 "drafts": [{"draft_id": d["draft_id"], "recipient": d.get("recipient", "")} for d in drafts_out],
                 "sample_drafts": drafts_out[:3],
@@ -193,9 +216,10 @@ async def gmail_bulk_create_drafts(
             "created": created_count,
             "failed": failed_count,
             "skipped": skipped_count,
+            "concurrency_used": step,
             "draft_ids": draft_ids,
             "drafts": drafts_out,
-            "individual_results": drafts_out + failures_out,
+            "individual_results": sorted(drafts_out + failures_out, key=lambda r: r["index"]),
             "retryable_failures": [f for f in failures_out if f.get("retryable")],
             "non_retryable_failures": [f for f in failures_out if not f.get("retryable")],
             "safe_to_continue": safe_to_continue,
@@ -215,11 +239,12 @@ async def gmail_bulk_attach_to_drafts(
     attachments: list[str] | None = None,
     *,
     per_draft_attachments: dict[str, list[str]] | None = None,
+    concurrency: int = 10,
 ) -> dict[str, Any]:
     """
-    Attach shared and/or draft-specific files to multiple existing drafts (e.g. 1 PDF to 100 drafts).
-    Implemented via `drafts.get(format='raw')`, MIME reconstruction preserving existing content/headers/attachments,
-    and individual `drafts.update` calls.
+    Attach shared and/or draft-specific files to multiple existing drafts concurrently (e.g. 1 PDF to 100 drafts).
+    Implemented via parallel `drafts.get(format='raw')`, MIME reconstruction preserving existing content/headers/attachments,
+    and individual `drafts.update` calls bounded by configurable concurrency.
     """
     try:
         if not draft_ids:
@@ -233,68 +258,79 @@ async def gmail_bulk_attach_to_drafts(
                 "Provide `attachments` (shared) and/or `per_draft_attachments`.",
             )
 
-        # Pre-validate all shared attachment files once before iterating over 100 drafts
+        # Pre-validate all shared attachment files once before iterating over drafts
         for att in shared_atts:
             client.safety.validate_attachment_file(att)
         for d_atts in per_draft_map.values():
             for att in d_atts:
                 client.safety.validate_attachment_file(att)
 
+        step = max(1, min(int(concurrency), 25))
+        sem = asyncio.Semaphore(step)
+        lock = asyncio.Lock()
+
         total_units = 0
         updated_drafts: list[dict[str, Any]] = []
         failed_drafts: list[dict[str, Any]] = []
         safe_to_continue = True
 
-        for idx, did in enumerate(draft_ids):
+        async def _attach_one(idx: int, did: str) -> None:
+            nonlocal safe_to_continue, total_units
+            if not safe_to_continue:
+                return
+
             extra_atts = list(dict.fromkeys(shared_atts + list(per_draft_map.get(did) or [])))
             if not extra_atts:
-                continue
-            try:
-                get_resp, g_meta = await client.execute_api(
-                    "drafts.get",
-                    {"id": did, "format": "raw"},
-                    tool_name="gmail_bulk_attach_to_drafts",
-                    op_class="read",
-                    fmt="raw",
-                )
-                total_units += int(g_meta.get("quota_estimate", 60))
-                msg_obj = get_resp.get("message") or {}
-                raw_b64 = msg_obj.get("raw") or ""
-                thread_id = msg_obj.get("threadId")
-                if not raw_b64:
-                    raise SafetyError("EMPTY_DRAFT_MIME", f"Draft '{did}' returned empty raw MIME.")
+                return
 
-                reconstructed = client.mime_builder.reconstruct_mime_from_raw(
-                    raw_b64,
-                    additional_attachments=extra_atts,
-                    preserve_existing_attachments=True,
-                    preserve_threading_headers=bool(thread_id),
-                )
-                upd_body: dict[str, Any] = {"message": {"raw": reconstructed["raw"]}}
-                if thread_id:
-                    upd_body["message"]["threadId"] = thread_id
+            async with sem:
+                if not safe_to_continue:
+                    return
+                try:
+                    get_resp, g_meta = await client.execute_api(
+                        "drafts.get",
+                        {"id": did, "format": "raw"},
+                        tool_name="gmail_bulk_attach_to_drafts",
+                        op_class="read",
+                        fmt="raw",
+                    )
+                    msg_obj = get_resp.get("message") or {}
+                    raw_b64 = msg_obj.get("raw") or ""
+                    thread_id = msg_obj.get("threadId")
+                    if not raw_b64:
+                        raise SafetyError("EMPTY_DRAFT_MIME", f"Draft '{did}' returned empty raw MIME.")
 
-                upd_resp, u_meta = await client.execute_api(
-                    "drafts.update",
-                    {"id": did, "body": upd_body},
-                    tool_name="gmail_bulk_attach_to_drafts",
-                    op_class="write",
-                    attachment_bytes=reconstructed["raw_mime_size_bytes"],
-                )
-                total_units += int(u_meta.get("quota_estimate", 15))
-                updated_drafts.append(
-                    {
+                    reconstructed = client.mime_builder.reconstruct_mime_from_raw(
+                        raw_b64,
+                        additional_attachments=extra_atts,
+                        preserve_existing_attachments=True,
+                        preserve_threading_headers=bool(thread_id),
+                    )
+                    upd_body: dict[str, Any] = {"message": {"raw": reconstructed["raw"]}}
+                    if thread_id:
+                        upd_body["message"]["threadId"] = thread_id
+
+                    upd_resp, u_meta = await client.execute_api(
+                        "drafts.update",
+                        {"id": did, "body": upd_body},
+                        tool_name="gmail_bulk_attach_to_drafts",
+                        op_class="write",
+                        attachment_bytes=reconstructed["raw_mime_size_bytes"],
+                    )
+                    units_consumed = int(g_meta.get("quota_estimate", 60)) + int(u_meta.get("quota_estimate", 15))
+                    item_updated = {
                         "index": idx,
                         "draft_id": upd_resp.get("id") or did,
                         "status": "updated",
                         "total_attachments": len(reconstructed["attachments"]),
                         "attachments": [a["filename"] for a in reconstructed["attachments"]],
                     }
-                )
-            except Exception as item_exc:
-                err = client.format_tool_error("gmail_bulk_attach_to_drafts", item_exc, mutates_mailbox=True)
-                failed_drafts.append(
-                    {
+                    async with lock:
+                        total_units += units_consumed
+                        updated_drafts.append(item_updated)
+                except Exception as item_exc:
+                    err = client.format_tool_error("gmail_bulk_attach_to_drafts", item_exc, mutates_mailbox=True)
+                    item_failed = {
                         "index": idx,
                         "draft_id": did,
                         "status": "failed",
@@ -302,14 +338,22 @@ async def gmail_bulk_attach_to_drafts(
                         "message": err["message"],
                         "retryable": err["retryable"],
                     }
-                )
-                if err["error_code"] in (
-                    "QUOTA_EXHAUSTED",
-                    "USER_RATE_LIMIT_HEADROOM_EXCEEDED",
-                    "PROJECT_RATE_LIMIT_HEADROOM_EXCEEDED",
-                ):
-                    safe_to_continue = False
-                    break
+                    async with lock:
+                        failed_drafts.append(item_failed)
+                        if err["error_code"] in (
+                            "QUOTA_EXHAUSTED",
+                            "USER_RATE_LIMIT_HEADROOM_EXCEEDED",
+                            "PROJECT_RATE_LIMIT_HEADROOM_EXCEEDED",
+                        ):
+                            safe_to_continue = False
+
+        await asyncio.gather(
+            *[_attach_one(idx, did) for idx, did in enumerate(draft_ids)],
+            return_exceptions=False,
+        )
+
+        updated_drafts.sort(key=lambda d: d["index"])
+        failed_drafts.sort(key=lambda f: f["index"])
 
         requested_count = len(draft_ids)
         updated_count = len(updated_drafts)
@@ -325,8 +369,11 @@ async def gmail_bulk_attach_to_drafts(
             "updated": updated_count,
             "failed": failed_count,
             "skipped": skipped_count,
+            "concurrency_used": step,
             "drafts": updated_drafts,
-            "individual_results": updated_drafts + failed_drafts,
+            "updated_drafts": updated_drafts,
+            "failed_drafts": failed_drafts,
+            "individual_results": sorted(updated_drafts + failed_drafts, key=lambda r: r["index"]),
             "retryable_failures": [f for f in failed_drafts if f.get("retryable")],
             "non_retryable_failures": [f for f in failed_drafts if not f.get("retryable")],
             "safe_to_continue": safe_to_continue,

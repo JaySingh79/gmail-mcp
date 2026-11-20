@@ -8,7 +8,7 @@
 
 ## 1. Executive Summary & Architecture Overview
 
-`gmail_mcp` is an enterprise-grade Model Context Protocol (MCP) server exposing **60 specialized tools** to LLM agents (Claude Code, Google Antigravity, Cursor, etc.) for autonomous Gmail management.
+`gmail_mcp` is an enterprise-grade Model Context Protocol (MCP) server exposing **61 specialized tools** to LLM agents (Claude Code, Google Antigravity, Cursor, etc.) for autonomous Gmail management.
 
 ### Architectural Philosophy
 1. **High Safety & Recipient Guardrails**: Rate-limiting token buckets, daily quota accounting, and blocklists prevent runaway loops from spamming or exhausting API limits.
@@ -43,7 +43,23 @@ flowchart TD
 
 ---
 
-## 2. Directory & File Map (What Each File Does & When to Read It)
+## 2. Core MCP Ecosystem & Most Common Tools
+
+> [!IMPORTANT]
+> **Primary MCP Servers**: `gmail_mcp` and `playwright` MCP are the two primary and most frequently used MCP servers in this ecosystem.
+
+### Most Common `gmail_mcp` Tools:
+1. **`gmail_authenticate` / `gmail_auth_status`**: Verify connection status or trigger browser OAuth consent flow when re-authentication is required.
+2. **`gmail_search_messages` / `gmail_get_message` / `gmail_list_unread`**: Search emails by query, read message bodies, headers, and attachment IDs.
+3. **`gmail_create_draft` / `gmail_list_drafts` / `gmail_update_draft`**: Create and refine individual email drafts with bodies and attachments from **any file path**.
+4. **`gmail_bulk_create_drafts`**: High-speed parallel generation of multiple or huge batches of personalized drafts (with configurable `concurrency=10`) from lead CSV/JSON and per-recipient attachment patterns (`{company}_cover_letter.pdf`).
+5. **`gmail_send_draft` / `gmail_send_email`**: Send staged drafts immediately or dispatch direct outbound messages with rate-limiting safety.
+6. **`gmail_prepare_bulk_send` & `gmail_execute_bulk_send`**: Two-phase bulk sending with plan previews, quota accounting, and confirmation phrase safety.
+7. **`gmail_attach_files_to_message` / `gmail_bulk_attach_to_drafts`**: Attach documents from **any file path or drive on your machine** onto drafts in parallel.
+
+---
+
+## 3. Directory & File Map (What Each File Does & When to Read It)
 
 To prevent LLM context bloat and token waste, **consult this routing guide before opening any file**:
 
@@ -124,11 +140,11 @@ To prevent LLM context bloat and token waste, **consult this routing guide befor
 
 ### C. Tool Implementations (`src/gmail_mcp/tools/`)
 
-All 60 tools are categorized across 14 dedicated modules:
+All 61 tools are categorized across 14 dedicated modules:
 
 | Module File | Exposed Tools | Description |
 | :--- | :--- | :--- |
-| [`tools/account.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/account.py) | `gmail_auth_status`<br>`gmail_get_profile`<br>`gmail_health_check`<br>`gmail_get_runtime_limits`<br>`gmail_get_mailbox_stats` | Inspects account connection, email address, total messages/threads, and active rate limits. |
+| [`tools/account.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/account.py) | `gmail_authenticate`<br>`gmail_auth_status`<br>`gmail_get_profile`<br>`gmail_health_check`<br>`gmail_get_runtime_limits`<br>`gmail_get_mailbox_stats` | Handles OAuth 2.0 authorization, inspects account connection, email address, total messages/threads, and active rate limits. |
 | [`tools/mailbox.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/mailbox.py) | `gmail_get_mailbox_settings`<br>`gmail_update_vacation_settings` | Inspects mailbox configuration, POP/IMAP, and configures Out-of-Office auto-responders. |
 | [`tools/messages.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/messages.py) | `gmail_get_message`<br>`gmail_list_unread`<br>`gmail_export_messages`<br>`gmail_modify_messages`<br>`gmail_bulk_label_messages` | Reads message contents/headers, retrieves unread emails, exports EML/JSON, and modifies labels. |
 | [`tools/threads.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/threads.py) | `gmail_get_thread` | Retrieves an entire email conversation thread with chronological message tree. |
@@ -145,7 +161,7 @@ All 60 tools are categorized across 14 dedicated modules:
 
 ---
 
-## 3. Crucial Distinction: SQLite Templates vs. Gmail Web UI Templates
+## 4. Crucial Distinction: SQLite Templates vs. Gmail Web UI Templates
 
 When working with "templates", there are **two distinct systems**:
 1. **Gmail Web UI Templates (Canned Responses)**:
@@ -160,7 +176,20 @@ When working with "templates", there are **two distinct systems**:
 
 ---
 
-## 4. Agent Navigation Rules: Avoid Token Bloat
+## 5. Attachment Access & Parallel Batch Processing
+
+- **Attachments from Any File Path**:
+  Attachments (such as cover letters, resumes, portfolios) can reside anywhere on disk:
+  - Absolute paths: `C:/Users/.../cover_letter.pdf`, `D:/Resumes/cover_letter.pdf`.
+  - Relative paths: `cover_letter.pdf`, `output/cover_letter.pdf` (resolved from CWD or workspace root).
+  - No restriction to `D:\Projects\gmail_mcp\attachments`.
+- **Parallel Draft Creation (`gmail_bulk_create_drafts`)**:
+  - Supports high-throughput concurrent draft generation using parallel workers (`concurrency: int = 10`, max 25).
+  - Processes recipient lists, CSV, or JSON leads with custom per-recipient attachment templates (`{company}_cover_letter.pdf`) 5-10x faster than sequential generation.
+
+---
+
+## 6. Agent Navigation Rules: Avoid Token Bloat
 
 > [!IMPORTANT]
 > **DO NOT read unnecessary files.** Always follow this lookup matrix:
@@ -176,7 +205,7 @@ When working with "templates", there are **two distinct systems**:
 
 ---
 
-## 5. Execution Commands & Guidelines
+## 7. Execution Commands & Guidelines
 
 All commands must be executed using `uv` with `--directory "D:\Projects\gmail_mcp"`:
 

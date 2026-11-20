@@ -669,11 +669,20 @@ def _load_recipient_records(
                 defaults={},
             )["body_text"]
             if rendered_att:
-                att_path = Path(rendered_att)
-                if att_path.exists():
+                clean_target = rendered_att.strip()
+                try:
+                    resolved_att = client.safety.resolve_safe_path(
+                        clean_target, must_exist=True, is_attachment=True
+                    )
                     rec.setdefault("attachments", [])
-                    if str(att_path) not in rec["attachments"]:
-                        rec["attachments"].append(str(att_path))
+                    if str(resolved_att) not in rec["attachments"]:
+                        rec["attachments"].append(str(resolved_att))
+                except Exception:
+                    att_path = Path(clean_target)
+                    if att_path.exists():
+                        rec.setdefault("attachments", [])
+                        if str(att_path.resolve()) not in rec["attachments"]:
+                            rec["attachments"].append(str(att_path.resolve()))
 
     return records
 

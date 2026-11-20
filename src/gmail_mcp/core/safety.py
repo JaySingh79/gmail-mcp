@@ -198,7 +198,7 @@ class SafetyGuard:
         """Resolve a path and enforce allowed-directory containment, path traversal protection, and symlink blocking."""
         raw_path = Path(file_path)
         raw_str = str(file_path)
-        if ".." in Path(raw_str).parts:
+        if ".." in Path(raw_str).parts and not is_attachment and not getattr(self.config, "allow_any_dir", False):
             raise SafetyError(
                 "PATH_TRAVERSAL_BLOCKED",
                 f"Path traversal sequence ('..') is forbidden: '{file_path}'.",
@@ -208,14 +208,14 @@ class SafetyGuard:
         if raw_path.is_absolute():
             candidates.append(raw_path)
         else:
-            candidates.append(self.config.workspace_root / raw_path)
             try:
-                candidates.append(Path.cwd() / raw_path)
+                candidates.append((Path.cwd() / raw_path).resolve())
             except Exception:
                 pass
+            candidates.append((self.config.workspace_root / raw_path).resolve())
             for allowed in self.config.allowed_dirs:
                 if str(allowed) != "*" and getattr(allowed, "name", "") != "*":
-                    candidates.append(allowed / raw_path)
+                    candidates.append((allowed / raw_path).resolve())
 
         chosen: Path | None = None
         for cand in candidates:

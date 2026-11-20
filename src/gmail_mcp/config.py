@@ -24,6 +24,184 @@ def _find_project_root() -> Path:
 
 WORKSPACE_ROOT = _find_project_root()
 
+CREDENTIALS_CANDIDATE_FILENAMES: list[str] = [
+    "creds_mcp_agy.json",
+    "creds_mcp_agy copy.json",
+    "credentials.json",
+    "client_secrets.json",
+    "client_secret.json",
+    "gmail_credentials.json",
+]
+
+TOKEN_CANDIDATE_FILENAMES: list[str] = [
+    "token.json",
+    "gmail_token.json",
+    "oauth_token.json",
+    ".token.json",
+]
+
+
+def get_candidate_search_directories(workspace_root: Path | None = None) -> list[Path]:
+    """Return ordered list of directories to search: explicit env, workspace root, CWD, global user dirs, and PATH."""
+    dirs: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(p: Path | str | None) -> None:
+        if not p:
+            return
+        try:
+            resolved = Path(p).expanduser().resolve()
+            key = str(resolved).lower() if os.name == "nt" else str(resolved)
+            if key not in seen and resolved.exists() and resolved.is_dir():
+                seen.add(key)
+                dirs.append(resolved)
+        except Exception:
+            pass
+
+    # 1. Explicit GMAIL_CONFIG_DIR env var
+    _add(os.getenv("GMAIL_CONFIG_DIR"))
+
+    # 2. Current working directory (local working directory takes priority)
+    try:
+        _add(Path.cwd())
+    except Exception:
+        pass
+
+    # 3. Workspace root
+    root = workspace_root or WORKSPACE_ROOT
+    _add(root)
+
+    # If an isolated custom workspace_root was provided (e.g. in tests), keep search isolated
+    if workspace_root is not None and workspace_root != WORKSPACE_ROOT:
+        return dirs
+
+    # 4. Authoritative project folder
+    _add(Path("D:/Projects/gmail_mcp"))
+
+    # 5. User home directories
+    try:
+        home = Path.home()
+        _add(home / ".gmail_mcp")
+        _add(home / ".config" / "gmail_mcp")
+        _add(home / ".gemini" / "antigravity-cli")
+        _add(home / ".gemini" / "antigravity-cli" / "mcp" / "gmail")
+        _add(home)
+    except Exception:
+        pass
+
+    # 6. System PATH directories
+    path_env = os.getenv("PATH", "")
+    for segment in path_env.split(os.pathsep):
+        s = segment.strip().strip('"')
+        if s:
+            _add(s)
+
+    return dirs
+
+
+def resolve_credentials_path(
+    explicit_path: Path | str | None = None,
+    workspace_root: Path | None = None,
+) -> Path:
+    """Resolve Google OAuth client credentials JSON from any directory or system PATH."""
+    if explicit_path:
+        p = Path(explicit_path).expanduser().resolve()
+        if p.is_file():
+            return p
+        if p.is_dir():
+            for fname in CREDENTIALS_CANDIDATE_FILENAMES:
+                cand = (p / fname).resolve()
+                if cand.is_file():
+                    return cand
+            return (p / "credentials.json").resolve()
+        return p
+
+    # If custom workspace_root is provided and differs from WORKSPACE_ROOT (e.g. in tests), check that custom root only
+    if workspace_root is not None and workspace_root != WORKSPACE_ROOT:
+        for fname in CREDENTIALS_CANDIDATE_FILENAMES:
+            cand = (workspace_root / fname).resolve()
+            if cand.is_file():
+                return cand
+        return (workspace_root / "credentials.json").resolve()
+
+    env_cred = os.getenv("GMAIL_CREDENTIALS_PATH")
+    if env_cred:
+        p = Path(env_cred).expanduser().resolve()
+        if p.is_dir():
+            for fname in CREDENTIALS_CANDIDATE_FILENAMES:
+                cand = (p / fname).resolve()
+                if cand.is_file():
+                    return cand
+            return (p / "credentials.json").resolve()
+        return p
+
+    search_dirs = get_candidate_search_directories(workspace_root)
+    for d in search_dirs:
+        for fname in CREDENTIALS_CANDIDATE_FILENAMES:
+            cand = (d / fname).resolve()
+            if cand.is_file():
+                return cand
+
+    # Also check for Google Cloud default download pattern: client_secret_*.json
+    for d in search_dirs:
+        try:
+            matches = sorted(d.glob("client_secret_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for cand in matches:
+                if cand.is_file():
+                    return cand.resolve()
+        except Exception:
+            pass
+
+    root = workspace_root or WORKSPACE_ROOT
+    return (root / "creds_mcp_agy.json").resolve()
+
+
+def resolve_token_path(
+    explicit_path: Path | str | None = None,
+    workspace_root: Path | None = None,
+) -> Path:
+    """Resolve OAuth token JSON from any directory or system PATH."""
+    if explicit_path:
+        p = Path(explicit_path).expanduser().resolve()
+        if p.is_file():
+            return p
+        if p.is_dir():
+            for fname in TOKEN_CANDIDATE_FILENAMES:
+                cand = (p / fname).resolve()
+                if cand.is_file():
+                    return cand
+            return (p / "token.json").resolve()
+        return p
+
+    # If custom workspace_root is provided and differs from WORKSPACE_ROOT (e.g. in tests), check that custom root only
+    if workspace_root is not None and workspace_root != WORKSPACE_ROOT:
+        for fname in TOKEN_CANDIDATE_FILENAMES:
+            cand = (workspace_root / fname).resolve()
+            if cand.is_file():
+                return cand
+        return (workspace_root / "token.json").resolve()
+
+    env_token = os.getenv("GMAIL_TOKEN_PATH")
+    if env_token:
+        p = Path(env_token).expanduser().resolve()
+        if p.is_dir():
+            for fname in TOKEN_CANDIDATE_FILENAMES:
+                cand = (p / fname).resolve()
+                if cand.is_file():
+                    return cand
+            return (p / "token.json").resolve()
+        return p
+
+    search_dirs = get_candidate_search_directories(workspace_root)
+    for d in search_dirs:
+        for fname in TOKEN_CANDIDATE_FILENAMES:
+            cand = (d / fname).resolve()
+            if cand.is_file():
+                return cand
+
+    root = workspace_root or WORKSPACE_ROOT
+    return (root / "token.json").resolve()
+
 # Authoritative Gmail REST API v1 Quota Cost Registry (Units per request)
 # Reference: https://developers.google.com/workspace/gmail/api/reference/quota
 QUOTA_COST_REGISTRY: dict[str, int] = {
@@ -131,14 +309,10 @@ class GmailConfig(BaseModel):
     # Paths
     workspace_root: Path = Field(default=WORKSPACE_ROOT)
     credentials_path: Path = Field(
-        default_factory=lambda: Path(
-            os.getenv("GMAIL_CREDENTIALS_PATH", str(WORKSPACE_ROOT / "creds_mcp_agy copy.json"))
-        )
+        default_factory=lambda: resolve_credentials_path()
     )
     token_path: Path = Field(
-        default_factory=lambda: Path(
-            os.getenv("GMAIL_TOKEN_PATH", str(WORKSPACE_ROOT / "token.json"))
-        )
+        default_factory=lambda: resolve_token_path()
     )
     db_path: Path = Field(
         default_factory=lambda: Path(

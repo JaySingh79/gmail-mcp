@@ -115,10 +115,13 @@ def build_insufficient_scope_report(
         "tool_requiring_scope": tool_name,
         "why_scope_is_required": reason,
         "scope_description": SCOPE_DESCRIPTIONS.get(req_scope, ""),
+        "action_required": "reauthenticate",
+        "suggested_tool": "gmail_authenticate",
+        "suggested_arguments": {"force_reauth": True},
         "reauthorization_steps": [
-            "1. Ensure the Gmail API is enabled in Google Cloud Console for project 542762227233.",
-            f"2. Ensure the OAuth Consent Screen includes scope: {req_scope}",
-            "3. Run: uv run --no-project python -m gmail_mcp.auth.oauth --login --force-reauth",
+            "1. Call tool: gmail_authenticate(force_reauth=True)",
+            "2. Or run: uv run --no-project python -m gmail_mcp.auth.oauth --login --force-reauth",
+            f"3. Ensure the OAuth Consent Screen includes scope: {req_scope}",
             "4. Approve all requested permissions in the browser window to update token.json.",
         ],
     }

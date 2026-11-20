@@ -22,6 +22,7 @@ from gmail_mcp.tools import (
     gmail_apply_label,
     gmail_attach_files_to_message,
     gmail_auth_status,
+    gmail_authenticate,
     gmail_bulk_attach_to_drafts,
     gmail_bulk_create_drafts,
     gmail_bulk_label_messages,
@@ -117,7 +118,7 @@ def create_gmail_mcp_server(
 ) -> tuple[FastMCP, GmailClientWrapper]:
     """
     Create and configure the Gmail Automation FastMCP server with shared dependency injection.
-    All 60 tools share the same `GmailClientWrapper`, `QuotaManager`, `RateLimiter`, and `DatabaseManager`.
+    All 61 tools share the same `GmailClientWrapper`, `QuotaManager`, `RateLimiter`, and `DatabaseManager`.
     """
     shared_client = client or GmailClientWrapper(GmailConfig())
     scheduler_worker = ScheduledSendWorker(shared_client)
@@ -143,8 +144,42 @@ def create_gmail_mcp_server(
     )
 
     # -------------------------------------------------------------------------
-    # A. Account and Diagnostics (5 Tools)
+    # A. Account and Diagnostics (6 Tools)
     # -------------------------------------------------------------------------
+
+    @mcp.tool(
+        name="gmail_authenticate",
+        description=(
+            "Execute Google OAuth 2.0 authorization for Gmail Automation MCP. "
+            "If already authenticated with valid tokens, returns immediately with user profile. "
+            "If unauthenticated or if `force_reauth=True`, launches the local loopback OAuth consent flow, "
+            "opens the default browser for consent approval, saves new tokens, and verifies API connectivity. "
+            "Call this tool when any tool returns an AUTH_NOT_CONFIGURED, TOKEN_MISSING, or TOKEN_REVOKED error."
+        ),
+        annotations=WRITE_SAFE_ANNOTATIONS,
+    )
+    async def _tool_gmail_authenticate(
+        force_reauth: bool = Field(
+            default=False,
+            description="When True, forces re-consent and requests a fresh refresh token even if an existing token file exists.",
+        ),
+        open_browser: bool = Field(
+            default=True,
+            description="When True, automatically opens the system browser to the Google OAuth consent page.",
+        ),
+        timeout_seconds: int = Field(
+            default=120,
+            ge=10,
+            le=600,
+            description="Timeout in seconds to wait for browser consent completion (default 120s).",
+        ),
+    ) -> dict[str, Any]:
+        return await gmail_authenticate(
+            shared_client,
+            force_reauth=force_reauth,
+            open_browser=open_browser,
+            timeout_seconds=timeout_seconds,
+        )
 
     @mcp.tool(
         name="gmail_get_profile",
@@ -540,7 +575,7 @@ def create_gmail_mcp_server(
         ),
         destination_directory: str = Field(
             default="exports",
-            description="Subfolder or path where exported files will be written. Must reside within allowed directories.",
+            description="Subfolder or path where exported files will be written (e.g. 'exports', 'data/exports', or any custom folder path).",
         ),
         filename_prefix: str = Field(
             default="gmail_export",
@@ -633,7 +668,7 @@ def create_gmail_mcp_server(
         ),
         attachments: list[str] | None = Field(
             default=None,
-            description="List of local file paths to attach to the draft (must reside within allowed project directories).",
+            description="List of local file paths to attach to the draft (accessible from any directory or drive on your machine, e.g. 'C:/Users/.../cover_letter.pdf', 'D:/Resumes/cover_letter.pdf', or relative paths).",
         ),
     ) -> dict[str, Any]:
         return await gmail_create_draft(
@@ -837,9 +872,9 @@ def create_gmail_mcp_server(
     @mcp.tool(
         name="gmail_bulk_create_drafts",
         description=(
-            "Generate 1 to 100+ personalized email drafts in batch from a recipient list and template, without sending them. "
-            "Interpolates variables like `{first_name}`, `{company}` per recipient and creates staged drafts in Gmail. "
-            "Use this tool for personalized outreach campaigns so the user can inspect drafts in Gmail before dispatching."
+            "Generate 1 to hundreds of personalized email drafts concurrently in parallel processing mode from a recipient list or CSV/JSON. "
+            "Interpolates variables like `{first_name}`, `{company}` per recipient and stages drafts in Gmail with rate limit & quota protection. "
+            "Supports per-recipient or shared attachments accessible from ANY local file path on disk (e.g. 'D:/Resumes/{company}_cover_letter.pdf')."
         ),
         annotations=WRITE_SAFE_ANNOTATIONS,
     )
@@ -850,7 +885,7 @@ def create_gmail_mcp_server(
         ),
         recipient_source: str | None = Field(
             default=None,
-            description="Optional CSV or JSON file path containing recipient or lead records.",
+            description="Optional CSV or JSON file path containing recipient or lead records (accessible from any local file path on disk).",
         ),
         field_mapping: dict[str, str] | None = Field(
             default=None,
@@ -858,7 +893,7 @@ def create_gmail_mcp_server(
         ),
         attachment_pattern: str | None = Field(
             default=None,
-            description="Optional attachment path template string (e.g. 'D:/Resumes/{company}_cover_letter.pdf') to attach per-recipient files.",
+            description="Optional attachment path template string (e.g. 'D:/Resumes/{company}_cover_letter.pdf', 'C:/Users/name/Documents/{company}_cover_letter.pdf') to attach per-recipient files from any path on disk.",
         ),
         template_id: str | None = Field(
             default=None,
@@ -878,11 +913,17 @@ def create_gmail_mcp_server(
         ),
         attachments: list[str] | None = Field(
             default=None,
-            description="Common list of local file paths to attach to every created draft.",
+            description="Common list of local file paths to attach to every created draft (accessible from any local file path or drive on disk).",
         ),
         compact: bool = Field(
             default=True,
             description="When True, returns a lightweight summary with created draft IDs and sample items, preventing context window bloating.",
+        ),
+        concurrency: int = Field(
+            default=10,
+            ge=1,
+            le=25,
+            description="Number of parallel worker tasks for concurrent high-speed draft generation (default: 10, max: 25).",
         ),
     ) -> dict[str, Any]:
         return await gmail_bulk_create_drafts(
@@ -897,14 +938,15 @@ def create_gmail_mcp_server(
             body_html=body_html,
             attachments=attachments,
             compact=compact,
+            concurrency=concurrency,
         )
 
     @mcp.tool(
         name="gmail_bulk_attach_to_drafts",
         description=(
-            "Attach one or multiple documents to multiple existing drafts in batch. "
+            "Attach one or multiple documents to multiple existing drafts concurrently in parallel batch. "
             "Supports adding a shared set of files to all specified drafts, or mapping unique files to individual draft IDs. "
-            "Preserves MIME structure and existing draft content."
+            "Attachments are accessible from any local file path on disk. Preserves MIME structure and existing draft content."
         ),
         annotations=WRITE_SAFE_ANNOTATIONS,
     )
@@ -915,11 +957,17 @@ def create_gmail_mcp_server(
         ),
         attachments: list[str] | None = Field(
             default=None,
-            description="Common file paths to attach to all specified drafts.",
+            description="Common file paths to attach to all specified drafts (accessible from any local file path on disk).",
         ),
         per_draft_attachments: dict[str, list[str]] | None = Field(
             default=None,
-            description="Optional mapping of specific draft_id to a list of draft-specific file paths.",
+            description="Optional mapping of specific draft_id to a list of draft-specific file paths (accessible from any local file path on disk).",
+        ),
+        concurrency: int = Field(
+            default=10,
+            ge=1,
+            le=25,
+            description="Number of parallel worker tasks for concurrent file attachment across drafts (default: 10, max: 25).",
         ),
     ) -> dict[str, Any]:
         return await gmail_bulk_attach_to_drafts(
@@ -927,6 +975,7 @@ def create_gmail_mcp_server(
             draft_ids=draft_ids,
             attachments=attachments,
             per_draft_attachments=per_draft_attachments,
+            concurrency=concurrency,
         )
 
     # -------------------------------------------------------------------------
@@ -2439,7 +2488,7 @@ async def dump_schemas(target_dir: Path | str | None = None) -> list[str]:
     instructions_content = (
         "# Gmail Automation MCP Server Instructions\n\n"
         "Production-grade Gmail Automation MCP Server using official Gmail REST API v1.\n"
-        "Provides 60 fine-grained tools for search, retrieval, drafting, sending, templates, attachments, "
+        "Provides 61 fine-grained tools for search, retrieval, drafting, sending, templates, attachments, "
         "labels, mailbox settings, filters, and scheduling.\n\n"
         "## Key Workflow Patterns\n"
         "1. **Reconnaissance & Auth**: Use `gmail_get_profile` and `gmail_auth_status` to verify user and token readiness.\n"
@@ -2475,7 +2524,7 @@ def main() -> int:
         nargs="?",
         const="",
         default=None,
-        help="Export all 60 tool JSON schemas and instructions.md into target directory (default: ~/.gemini/antigravity-cli/mcp/gmail)",
+        help="Export all 61 tool JSON schemas and instructions.md into target directory (default: ~/.gemini/antigravity-cli/mcp/gmail)",
     )
     parser.add_argument(
         "--ignore-lock",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -108,23 +109,29 @@ if lock.acquire(transport='stdio'):
     proc2_lock.release()
 
 
-def test_server_main_cli_singleton_rejection(tmp_path: Path) -> None:
+def test_server_main_cli_singleton_rejection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Test that running the server entrypoint twice via CLI rejects the second launch."""
     from gmail_mcp.config import WORKSPACE_ROOT
 
-    # First acquire the default singleton lock to simulate an already running server
-    lock = SingleInstanceLock()
+    custom_lock_path = tmp_path / "cli_singleton.lock"
+    monkeypatch.setenv("GMAIL_LOCK_PATH", str(custom_lock_path))
+
+    # First acquire the singleton lock at custom_lock_path to simulate an already running server
+    lock = SingleInstanceLock(lock_path=custom_lock_path)
     assert lock.acquire() is True
 
     try:
-        # Launch main.py in a subprocess (simulating user trying to run main.py again)
+        # Launch main.py in a subprocess with GMAIL_LOCK_PATH pointing to custom_lock_path
         main_script = Path(WORKSPACE_ROOT) / "main.py"
+        env = dict(os.environ)
+        env["GMAIL_LOCK_PATH"] = str(custom_lock_path)
         res = subprocess.run(
             [sys.executable, str(main_script)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             timeout=10,
+            env=env,
         )
         assert res.returncode == 1
         assert "[GMAIL_MCP_ERROR] Another instance of Gmail MCP Server is already running" in res.stderr

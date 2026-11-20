@@ -10,7 +10,12 @@
 credentials.json
 *creds*.json
 token.json
+client_secret*.json
 client_secrets*.json
+*.old
+run_server.txt
+*.jpeg
+*.jpg
 data/pending_auth_url.txt
 *.pem
 *.key

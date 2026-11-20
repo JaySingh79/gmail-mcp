@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -22,14 +23,15 @@ class _AuthUrlNotifier:
     def __init__(self, callback_url_file: Path | None = None) -> None:
         self.callback_url_file = callback_url_file
 
-    def format(self, url: str) -> str:
+    def format(self, *args: Any, **kwargs: Any) -> str:
+        url = kwargs.get("url") or (args[0] if args else "")
         msg = (
             f"\n=======================================================\n"
             f"PLEASE VISIT THIS URL TO AUTHORIZE GMAIL MCP:\n{url}\n"
             f"=======================================================\n"
         )
-        sys.stdout.write(msg)
-        sys.stdout.flush()
+        sys.stderr.write(msg)
+        sys.stderr.flush()
         if self.callback_url_file:
             try:
                 self.callback_url_file.write_text(url, encoding="utf-8")
@@ -74,11 +76,31 @@ class OAuthFlowManager:
                 }
 
         if not self.config.credentials_path.exists():
+            from gmail_mcp.config import resolve_credentials_path
+            resolved = resolve_credentials_path(workspace_root=self.config.workspace_root)
+            if resolved.exists():
+                self.config.credentials_path = resolved
+
+        if not self.config.credentials_path.exists():
             raise FileNotFoundError(
                 f"OAuth client secret file not found at '{self.config.credentials_path}'. "
                 "Download your Desktop App OAuth 2.0 Client ID JSON from Google Cloud Console "
                 "(Project 542762227233) and save it as 'credentials.json'."
             )
+
+        if port == 0:
+            try:
+                from urllib.parse import urlparse
+                with open(self.config.credentials_path, "r", encoding="utf-8") as f:
+                    client_data = json.load(f)
+                client_info = client_data.get("web") or client_data.get("installed") or {}
+                for uri in client_info.get("redirect_uris", []):
+                    parsed = urlparse(uri)
+                    if parsed.hostname in ("localhost", "127.0.0.1") and parsed.port:
+                        port = parsed.port
+                        break
+            except Exception:
+                pass
 
         url_file = self.config.workspace_root / "data" / "pending_auth_url.txt"
         notifier = _AuthUrlNotifier(callback_url_file=url_file)
@@ -87,13 +109,25 @@ class OAuthFlowManager:
             str(self.config.credentials_path),
             scopes=target_scopes,
         )
-        creds = flow.run_local_server(
-            port=port,
-            access_type="offline",
-            prompt="consent",
-            open_browser=open_browser,
-            authorization_prompt_message=notifier,
-        )
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                creds = flow.run_local_server(
+                    port=port,
+                    access_type="offline",
+                    prompt="consent",
+                    open_browser=open_browser,
+                    authorization_prompt_message=notifier,
+                )
+        except KeyboardInterrupt:
+            sys.stderr.write("\n[OAuth] Interactive login cancelled by user (Ctrl+C).\n")
+            sys.stderr.flush()
+            raise
+        finally:
+            if url_file.exists():
+                try:
+                    url_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
         self.token_manager.save_credentials(creds)
         profile = self.verify_with_get_profile()
         return {
@@ -131,27 +165,37 @@ def main() -> int:
     token_mgr = TokenManager(config)
     flow_mgr = OAuthFlowManager(config, token_mgr)
 
-    if args.login:
-        result = flow_mgr.run_interactive_login(port=args.port, force_reauth=args.force_reauth)
-        print(json.dumps(result, indent=2))
-        return 0
+    try:
+        if args.login:
+            result = flow_mgr.run_interactive_login(port=args.port, force_reauth=args.force_reauth)
+            print(json.dumps(result, indent=2))
+            return 0
 
-    status = token_mgr.get_auth_status(auto_refresh=True)
-    output: dict[str, Any] = status.model_dump()
-    if status.authenticated:
-        try:
-            profile = flow_mgr.verify_with_get_profile()
-            output["profile"] = {
-                "emailAddress": profile.get("emailAddress"),
-                "messagesTotal": profile.get("messagesTotal"),
-                "threadsTotal": profile.get("threadsTotal"),
-                "historyId": profile.get("historyId"),
-            }
-        except Exception as exc:
-            output["profile_error"] = f"{type(exc).__name__}: {exc}"
-    print(json.dumps(output, indent=2))
-    return 0 if status.authenticated else 1
+        status = token_mgr.get_auth_status(auto_refresh=True)
+        output: dict[str, Any] = status.model_dump()
+        if status.authenticated:
+            try:
+                profile = flow_mgr.verify_with_get_profile()
+                output["profile"] = {
+                    "emailAddress": profile.get("emailAddress"),
+                    "messagesTotal": profile.get("messagesTotal"),
+                    "threadsTotal": profile.get("threadsTotal"),
+                    "historyId": profile.get("historyId"),
+                }
+            except Exception as exc:
+                output["profile_error"] = f"{type(exc).__name__}: {exc}"
+        print(json.dumps(output, indent=2))
+        return 0 if status.authenticated else 1
+    except KeyboardInterrupt:
+        sys.stderr.write("\n[OAuth] Operation cancelled by user (Ctrl+C). Exiting.\n")
+        sys.stderr.flush()
+        return 130
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.stderr.write("\n[OAuth] Interrupted. Exiting.\n")
+        sys.stderr.flush()
+        sys.exit(130)

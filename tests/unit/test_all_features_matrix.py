@@ -640,3 +640,39 @@ async def test_export_messages_json_csv_eml_and_attachments(
     )
     assert res_eml["success"] is True
     assert Path(res_eml["exported_files"][0]).suffix == ".eml"
+
+
+@pytest.mark.asyncio()
+async def test_bulk_create_drafts_parallel_processing_and_any_attachment_path(
+    gmail_client: GmailClientWrapper,
+    temp_workspace: dict[str, Path],
+) -> None:
+    """Verify high-throughput parallel draft generation with arbitrary attachment paths."""
+    from gmail_mcp.tools.bulk_operations import gmail_bulk_create_drafts
+
+    # Create an arbitrary external cover letter outside workspace attachments folder
+    external_dir = temp_workspace["root"] / "external_custom_docs"
+    external_dir.mkdir(parents=True, exist_ok=True)
+    cover_letter = external_dir / "cover_letter.pdf"
+    cover_letter.write_text("Dummy cover letter text", encoding="utf-8")
+
+    recipients = [
+        {"to": f"candidate_{i}@example.com", "name": f"Candidate {i}", "company": f"Corp {i}"}
+        for i in range(15)
+    ]
+
+    res = await gmail_bulk_create_drafts(
+        gmail_client,
+        recipients=recipients,
+        subject="Application for {company}",
+        body_text="Hello {name}, please find my cover letter attached.",
+        attachments=[str(cover_letter)],
+        concurrency=5,
+        compact=False,
+    )
+    assert res["success"] is True
+    assert res["created"] == 15
+    assert res["concurrency_used"] == 5
+    assert len(res["draft_ids"]) == 15
+    assert res["drafts"][0]["attachment_count"] == 1
+
