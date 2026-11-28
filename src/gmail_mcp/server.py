@@ -25,6 +25,8 @@ from gmail_mcp.tools import (
     gmail_authenticate,
     gmail_bulk_attach_to_drafts,
     gmail_bulk_create_drafts,
+    gmail_bulk_delete_draft,
+    gmail_bulk_delete_drafts,
     gmail_bulk_label_messages,
     gmail_bulk_send_drafts,
     gmail_cancel_scheduled_send,
@@ -873,15 +875,20 @@ def create_gmail_mcp_server(
         name="gmail_bulk_create_drafts",
         description=(
             "Generate 1 to hundreds of personalized email drafts concurrently in parallel processing mode from a recipient list or CSV/JSON. "
-            "Interpolates variables like `{first_name}`, `{company}` per recipient and stages drafts in Gmail with rate limit & quota protection. "
-            "Supports per-recipient or shared attachments accessible from ANY local file path on disk (e.g. 'D:/Resumes/{company}_cover_letter.pdf')."
+            "Interpolates variables like `{{first_name}}`, `{{company}}` per recipient and stages drafts in Gmail with rate limit & quota protection. "
+            "Supports threaded bulk reply drafts via per-recipient `in_reply_to`, `message_id`, or `thread_id`—automatically fetching the parent message "
+            "to populate `to`, `thread_id`, `references`, `Re:` subject, `recipient_name` (from body greeting), and `company` (from subject) when omitted. "
+            "Also supports per-recipient or shared attachments accessible from ANY local file path on disk (e.g. 'D:/Resumes/{company}_cover_letter.pdf')."
         ),
         annotations=WRITE_SAFE_ANNOTATIONS,
     )
     async def _tool_gmail_bulk_create_drafts(
         recipients: list[dict[str, Any]] | None = Field(
             default=None,
-            description="List of recipient dictionaries, each containing 'to' (email string) and optional template variables (e.g. [{'to': 'a@b.com', 'name': 'Alice'}]).",
+            description=(
+                "List of recipient dictionaries, each containing 'to' (or 'in_reply_to'/'message_id'/'thread_id' for auto-populated reply drafts) "
+                "and optional template variables (e.g. [{'to': 'a@b.com', 'name': 'Alice'}] or [{'in_reply_to': '<msg@mail.gmail.com>'}])."
+            ),
         ),
         recipient_source: str | None = Field(
             default=None,
@@ -894,6 +901,16 @@ def create_gmail_mcp_server(
         attachment_pattern: str | None = Field(
             default=None,
             description="Optional attachment path template string (e.g. 'D:/Resumes/{company}_cover_letter.pdf', 'C:/Users/name/Documents/{company}_cover_letter.pdf') to attach per-recipient files from any path on disk.",
+        ),
+        query: str | None = Field(
+            default=None,
+            description="Optional Gmail search query (e.g. 'in:sent after:2026/11/19') to fetch parent messages in one batch and auto-stage threaded reply drafts.",
+        ),
+        max_results: int = Field(
+            default=50,
+            ge=1,
+            le=500,
+            description="Maximum number of messages to fetch when using `query` (default 50, max 500).",
         ),
         template_id: str | None = Field(
             default=None,
@@ -925,6 +942,14 @@ def create_gmail_mcp_server(
             le=25,
             description="Number of parallel worker tasks for concurrent high-speed draft generation (default: 10, max: 25).",
         ),
+        run_async: bool = Field(
+            default=False,
+            description="If True, executes bulk draft creation in the background and returns a `job_id` immediately to poll with `gmail_get_bulk_status`.",
+        ),
+        skip_bounced: bool = Field(
+            default=True,
+            description="When True (default), reply drafts (`thread_id`/`in_reply_to`/`message_id`/`query`) inspect the target thread for bounce/DSN indicators (mailer-daemon, Outlook/SMTP errors, blocked/undelivered notices) and skip bounced threads.",
+        ),
     ) -> dict[str, Any]:
         return await gmail_bulk_create_drafts(
             shared_client,
@@ -932,6 +957,8 @@ def create_gmail_mcp_server(
             recipient_source=recipient_source,
             field_mapping=field_mapping,
             attachment_pattern=attachment_pattern,
+            query=query,
+            max_results=max_results,
             template_id=template_id,
             subject=subject,
             body_text=body_text,
@@ -939,6 +966,8 @@ def create_gmail_mcp_server(
             attachments=attachments,
             compact=compact,
             concurrency=concurrency,
+            run_async=run_async,
+            skip_bounced=skip_bounced,
         )
 
     @mcp.tool(
@@ -976,6 +1005,114 @@ def create_gmail_mcp_server(
             attachments=attachments,
             per_draft_attachments=per_draft_attachments,
             concurrency=concurrency,
+        )
+
+    @mcp.tool(
+        name="gmail_bulk_delete_drafts",
+        description=(
+            "Delete multiple email drafts concurrently in parallel batch. "
+            "Allows deleting drafts either by an explicit list of `draft_ids`, or discovered via a Gmail search `query` "
+            "(e.g. 'subject:Application' or 'in:drafts'), or filtered to reply drafts only (`filter_reply_only=True`). "
+            "Supports dry-run preview (`dry_run=True`), high-speed parallel workers (`concurrency`), "
+            "and asynchronous background execution (`run_async=True`)."
+        ),
+        annotations=DESTRUCTIVE_ANNOTATIONS,
+    )
+    async def _tool_gmail_bulk_delete_drafts(
+        draft_ids: list[str] | None = Field(
+            default=None,
+            description="Explicit list of draft IDs to permanently delete.",
+        ),
+        query: str | None = Field(
+            default=None,
+            description="Optional Gmail search query to locate candidate drafts to delete (e.g. 'subject:Follow up' or 'after:2026/11/01').",
+        ),
+        filter_reply_only: bool = Field(
+            default=False,
+            description="When True, only deletes drafts that are replies to existing conversation threads (verified via In-Reply-To/References headers, threadId matching, or Re:/Following up subject prefix), safely preserving standalone drafts and templates.",
+        ),
+        max_delete: int = Field(
+            default=50,
+            ge=1,
+            le=500,
+            description="Maximum number of drafts to delete (default: 50, max: 500).",
+        ),
+        concurrency: int = Field(
+            default=10,
+            ge=1,
+            le=25,
+            description="Number of parallel worker tasks for concurrent draft deletion (default: 10, max: 25).",
+        ),
+        dry_run: bool = Field(
+            default=False,
+            description="If True, returns matched candidate draft IDs without actually deleting them from the mailbox.",
+        ),
+        run_async: bool = Field(
+            default=False,
+            description="If True, executes bulk draft deletion in background and returns a `job_id` immediately to poll with `gmail_get_bulk_status`.",
+        ),
+    ) -> dict[str, Any]:
+        return await gmail_bulk_delete_drafts(
+            shared_client,
+            draft_ids=draft_ids,
+            query=query,
+            filter_reply_only=filter_reply_only,
+            max_delete=max_delete,
+            concurrency=concurrency,
+            dry_run=dry_run,
+            run_async=run_async,
+        )
+
+    @mcp.tool(
+        name="gmail_bulk_delete_draft",
+        description=(
+            "Alias for `gmail_bulk_delete_drafts`. Permanently delete multiple drafts concurrently in parallel batch."
+        ),
+        annotations=DESTRUCTIVE_ANNOTATIONS,
+    )
+    async def _tool_gmail_bulk_delete_draft(
+        draft_ids: list[str] | None = Field(
+            default=None,
+            description="Explicit list of draft IDs to permanently delete.",
+        ),
+        query: str | None = Field(
+            default=None,
+            description="Optional Gmail search query to locate candidate drafts to delete.",
+        ),
+        filter_reply_only: bool = Field(
+            default=False,
+            description="When True, only deletes drafts that are replies to existing conversation threads, safely preserving standalone drafts and templates.",
+        ),
+        max_delete: int = Field(
+            default=50,
+            ge=1,
+            le=500,
+            description="Maximum number of drafts to delete (default: 50, max: 500).",
+        ),
+        concurrency: int = Field(
+            default=10,
+            ge=1,
+            le=25,
+            description="Number of parallel worker tasks (default: 10, max: 25).",
+        ),
+        dry_run: bool = Field(
+            default=False,
+            description="If True, previews matched drafts without deleting them.",
+        ),
+        run_async: bool = Field(
+            default=False,
+            description="If True, executes in background and returns a `job_id`.",
+        ),
+    ) -> dict[str, Any]:
+        return await gmail_bulk_delete_drafts(
+            shared_client,
+            draft_ids=draft_ids,
+            query=query,
+            filter_reply_only=filter_reply_only,
+            max_delete=max_delete,
+            concurrency=concurrency,
+            dry_run=dry_run,
+            run_async=run_async,
         )
 
     # -------------------------------------------------------------------------
@@ -1435,6 +1572,10 @@ def create_gmail_mcp_server(
             default=False,
             description="When True, launches bulk sending in the background and returns a job_id for monitoring.",
         ),
+        non_blocking_practice: bool = Field(
+            default=True,
+            description="When True (default), enforces anti-spam pacing: max 40 emails/hour globally, max 2 emails/hour per recipient domain with round-robin domain interleaving and randomized jitter.",
+        ),
     ) -> dict[str, Any]:
         return await gmail_execute_bulk_send(
             shared_client,
@@ -1444,6 +1585,7 @@ def create_gmail_mcp_server(
             concurrency=concurrency,
             compact=compact,
             run_async=run_async,
+            non_blocking_practice=non_blocking_practice,
         )
 
     @mcp.tool(
@@ -1472,6 +1614,10 @@ def create_gmail_mcp_server(
             default=False,
             description="When True, spawns sending as a background task and returns a job_id immediately.",
         ),
+        non_blocking_practice: bool = Field(
+            default=True,
+            description="When True (default), enforces anti-spam pacing: max 40 emails/hour globally, max 2 emails/hour per recipient domain with round-robin domain interleaving and randomized jitter.",
+        ),
     ) -> dict[str, Any]:
         return await gmail_bulk_send_drafts(
             shared_client,
@@ -1479,6 +1625,7 @@ def create_gmail_mcp_server(
             concurrency=concurrency,
             compact=compact,
             run_async=run_async,
+            non_blocking_practice=non_blocking_practice,
         )
 
     @mcp.tool(
@@ -1552,11 +1699,21 @@ def create_gmail_mcp_server(
             ...,
             description="Exact confirmation phrase: 'CONFIRM_REPLY_<plan_id>' required to unlock execution.",
         ),
+        run_async: bool = Field(
+            default=False,
+            description="When True, spawns replying as a background task and returns a job_id immediately.",
+        ),
+        non_blocking_practice: bool = Field(
+            default=True,
+            description="When True (default), enforces anti-spam pacing: max 40 emails/hour globally, max 2 emails/hour per recipient domain with round-robin domain interleaving and randomized jitter.",
+        ),
     ) -> dict[str, Any]:
         return await gmail_execute_bulk_reply(
             shared_client,
             plan_id=plan_id,
             confirmation_phrase=confirmation_phrase,
+            run_async=run_async,
+            non_blocking_practice=non_blocking_practice,
         )
 
     # -------------------------------------------------------------------------

@@ -670,9 +670,431 @@ async def test_bulk_create_drafts_parallel_processing_and_any_attachment_path(
         concurrency=5,
         compact=False,
     )
-    assert res["success"] is True
+    assert res["success"] is True, res
     assert res["created"] == 15
     assert res["concurrency_used"] == 5
     assert len(res["draft_ids"]) == 15
     assert res["drafts"][0]["attachment_count"] == 1
+
+
+@pytest.mark.asyncio()
+async def test_bulk_create_drafts_threaded_replies(
+    gmail_client: GmailClientWrapper,
+) -> None:
+    """Verify gmail_bulk_create_drafts attaches threadId and RFC In-Reply-To/References headers."""
+    import base64
+    from email import message_from_bytes
+    from gmail_mcp.tools.bulk_operations import gmail_bulk_create_drafts
+
+    created_payloads: list[dict] = []
+    orig_execute = gmail_client.execute_api
+
+    async def _spy_execute(endpoint, params=None, **kwargs):
+        if endpoint == "drafts.create" and params:
+            created_payloads.append(params["body"])
+        return await orig_execute(endpoint, params, **kwargs)
+
+    gmail_client.execute_api = _spy_execute  # type: ignore[method-assign]
+
+    recipients = [
+        {
+            "to": f"recruiter_{i}@example.com",
+            "name": f"Recruiter {i}",
+            "company": f"Acme {i}",
+            "thread_id": f"th_{i}",
+            "in_reply_to": f"<orig-{i}@mail.gmail.com>",
+            "references": f"<orig-{i}@mail.gmail.com>",
+            "subject": f"Re: Role at Acme {i}",
+        }
+        for i in range(3)
+    ]
+
+    res = await gmail_bulk_create_drafts(
+        gmail_client,
+        recipients=recipients,
+        body_text="Hi {name}, following up at {company}.",
+        concurrency=3,
+        compact=False,
+    )
+    assert res["success"] is True, res
+    assert res["created"] == 3
+    assert len(created_payloads) == 3
+
+    for i, payload in enumerate(created_payloads):
+        msg_obj = payload["message"]
+        assert msg_obj["threadId"] == f"th_{i}"
+        raw_bytes = base64.urlsafe_b64decode(msg_obj["raw"] + "==")
+        parsed = message_from_bytes(raw_bytes)
+        assert parsed["In-Reply-To"] == f"<orig-{i}@mail.gmail.com>"
+        assert parsed["References"] == f"<orig-{i}@mail.gmail.com>"
+        assert parsed["Subject"] == f"Re: Role at Acme {i}"
+
+
+@pytest.mark.asyncio()
+async def test_bulk_create_drafts_auto_extracts_from_in_reply_to(
+    gmail_client: GmailClientWrapper,
+) -> None:
+    """Verify passing only in_reply_to auto-populates to, thread_id, subject, recipient_name, and company."""
+    import base64
+    from email import message_from_bytes
+    from gmail_mcp.tools.bulk_operations import gmail_bulk_create_drafts
+
+    created_payloads: list[dict] = []
+    orig_execute = gmail_client.execute_api
+
+    async def _spy_execute(endpoint, params=None, **kwargs):
+        if endpoint == "messages.list":
+            return {"messages": [{"id": "msg_parent_1"}]}, {"quota_estimate": 5}
+        if endpoint == "messages.get":
+            raw_parent = base64.urlsafe_b64encode(
+                b"From: Jay Singh <jays.iitkgp@gmail.com>\r\n"
+                b"To: susmitlakra@fpl.tech\r\n"
+                b"Subject: Application for DS/AI/ML Full Time Opportunities at OneCard\r\n"
+                b"Message-ID: <orig-onecard@mail.gmail.com>\r\n\r\n"
+                b"Hello Susmit,\r\nMy name is Jay Singh."
+            ).decode("ascii").rstrip("=")
+            return {
+                "id": "msg_parent_1",
+                "threadId": "th_onecard_1",
+                "labelIds": ["SENT"],
+                "payload": {
+                    "headers": [
+                        {"name": "From", "value": "Jay Singh <jays.iitkgp@gmail.com>"},
+                        {"name": "To", "value": "susmitlakra@fpl.tech"},
+                        {"name": "Subject", "value": "Application for DS/AI/ML Full Time Opportunities at OneCard"},
+                        {"name": "Message-ID", "value": "<orig-onecard@mail.gmail.com>"},
+                    ],
+                    "mimeType": "text/plain",
+                    "body": {"data": base64.urlsafe_b64encode(b"Hello Susmit,\nMy name is Jay Singh.").decode("ascii")},
+                },
+                "raw": raw_parent,
+            }, {"quota_estimate": 20}
+        if endpoint == "drafts.create" and params:
+            created_payloads.append(params["body"])
+        return await orig_execute(endpoint, params, **kwargs)
+
+    gmail_client.execute_api = _spy_execute  # type: ignore[method-assign]
+
+    from gmail_mcp.tools.templates import gmail_create_template
+
+    await gmail_create_template(
+        gmail_client,
+        template_id="auto_reply_tpl",
+        name="Auto Reply Test",
+        subject="Following up: {{company}}",
+        body_text="Hi {{recipient_name}}, following up at {{company}}.",
+        variables=["recipient_name", "company"],
+    )
+
+    res = await gmail_bulk_create_drafts(
+        gmail_client,
+        recipients=[{"in_reply_to": "<orig-onecard@mail.gmail.com>"}],
+        template_id="auto_reply_tpl",
+        compact=False,
+    )
+    assert res["success"] is True, res
+    assert res["created"] == 1
+    msg_obj = created_payloads[0]["message"]
+    assert msg_obj["threadId"] == "th_onecard_1"
+    raw_bytes = base64.urlsafe_b64decode(msg_obj["raw"] + "==")
+    parsed = message_from_bytes(raw_bytes)
+    assert parsed["To"] == "susmitlakra@fpl.tech"
+    assert parsed["Subject"] == "Re: Application for DS/AI/ML Full Time Opportunities at OneCard"
+    assert parsed["In-Reply-To"] == "<orig-onecard@mail.gmail.com>"
+    assert "Hi Susmit, following up at OneCard." in parsed.get_payload(decode=True).decode("utf-8")
+
+
+@pytest.mark.asyncio()
+async def test_bulk_create_drafts_metadata_first_query_and_run_async(
+    gmail_client: GmailClientWrapper,
+) -> None:
+    """Verify query-based batching (zero per-item lookups) and run_async=True job tracking."""
+    import asyncio
+    from gmail_mcp.tools.bulk_operations import gmail_bulk_create_drafts
+    from gmail_mcp.tools.sending import gmail_get_bulk_status
+    from gmail_mcp.tools.templates import gmail_create_template
+
+    await gmail_create_template(
+        gmail_client,
+        template_id="fast_bulk_tpl",
+        name="Fast Bulk Test",
+        subject="Following up: {{company}}",
+        body_text="Hi {{recipient_name}}, following up at {{company}}.",
+        variables=["recipient_name", "company"],
+    )
+
+    get_calls: list[dict] = []
+    orig_execute = gmail_client.execute_api
+
+    async def _spy_execute(endpoint, params=None, **kwargs):
+        if endpoint == "messages.list":
+            return {"messages": [{"id": "m1"}, {"id": "m2"}]}, {"quota_estimate": 5}
+        if endpoint == "messages.get":
+            get_calls.append(params or {})
+            idx = 1 if (params or {}).get("id") == "m1" else 2
+            name = "Alice" if idx == 1 else "Bob"
+            return {
+                "id": f"m{idx}",
+                "threadId": f"th_{idx}",
+                "labelIds": ["SENT"],
+                "snippet": f"Hello {name}, My name is Jay Singh.",
+                "payload": {
+                    "headers": [
+                        {"name": "From", "value": "Jay Singh <jays.iitkgp@gmail.com>"},
+                        {"name": "To", "value": f"{name.lower()}@corp{idx}.com"},
+                        {"name": "Subject", "value": f"Application at Corp{idx}"},
+                        {"name": "Message-ID", "value": f"<orig-{idx}@mail.gmail.com>"},
+                    ],
+                },
+            }, {"quota_estimate": 20}
+        return await orig_execute(endpoint, params, **kwargs)
+
+    gmail_client.execute_api = _spy_execute  # type: ignore[method-assign]
+
+    res = await gmail_bulk_create_drafts(
+        gmail_client,
+        query="in:sent after:2026/11/19",
+        max_results=10,
+        template_id="fast_bulk_tpl",
+        run_async=True,
+    )
+    assert res["success"] is True, res
+    assert res["status"] == "RUNNING"
+    assert res["total"] == 2
+    assert res["job_id"].startswith("job_create_drafts_")
+    # Only metadata fetches from gmail_search_messages; zero format='full' downloads
+    assert all(c.get("format") == "metadata" for c in get_calls)
+
+    await asyncio.sleep(0.05)
+    status = await gmail_get_bulk_status(gmail_client, res["job_id"])
+    assert status["success"] is True
+    assert status["status"] == "COMPLETED"
+    assert status["sent"] == 2
+    assert status["failed"] == 0
+
+
+@pytest.mark.asyncio()
+async def test_bulk_delete_drafts_and_alias(
+    gmail_client: GmailClientWrapper,
+) -> None:
+    """Verify bulk draft deletion: ID list, query discovery, reply filtering, dry-run, async mode, and alias."""
+    import asyncio
+    from gmail_mcp.tools.bulk_operations import (
+        gmail_bulk_delete_draft,
+        gmail_bulk_delete_drafts,
+    )
+    from gmail_mcp.tools.sending import gmail_get_bulk_status
+
+    deleted_calls: list[str] = []
+
+    async def _mock_execute(endpoint, params=None, **kwargs):
+        if endpoint == "drafts.list":
+            return {
+                "drafts": [
+                    {"id": "d_reply_1"},
+                    {"id": "d_reply_2"},
+                    {"id": "d_normal_3"},
+                ]
+            }, {"quota_estimate": 5}
+        if endpoint == "drafts.get":
+            did = (params or {}).get("id")
+            if did in ("d_reply_1", "d_reply_2"):
+                headers = [
+                    {"name": "Subject", "value": "Re: Opportunity"},
+                    {"name": "In-Reply-To", "value": "<ref@corp.com>"},
+                ]
+            else:
+                headers = [{"name": "Subject", "value": "New Outreach"}]
+            return {
+                "id": did,
+                "message": {"payload": {"headers": headers}},
+            }, {"quota_estimate": 5}
+        if endpoint == "drafts.delete":
+            deleted_calls.append((params or {}).get("id"))
+            return {}, {"quota_estimate": 10}
+        return {}, {}
+
+    gmail_client.execute_api = _mock_execute  # type: ignore[method-assign]
+
+    # 1. Dry run with query + filter_reply_only
+    dry_res = await gmail_bulk_delete_drafts(
+        gmail_client,
+        query="in:drafts",
+        filter_reply_only=True,
+        dry_run=True,
+    )
+    assert dry_res["success"] is True
+    assert dry_res["dry_run"] is True
+    assert dry_res["target_count"] == 2
+    assert dry_res["draft_ids"] == ["d_reply_1", "d_reply_2"]
+    assert len(deleted_calls) == 0
+
+    # 2. Synchronous execution with filter_reply_only
+    del_res = await gmail_bulk_delete_drafts(
+        gmail_client,
+        filter_reply_only=True,
+        dry_run=False,
+    )
+    assert del_res["success"] is True
+    assert del_res["deleted_count"] == 2
+    assert del_res["deleted_draft_ids"] == ["d_reply_1", "d_reply_2"]
+    assert deleted_calls == ["d_reply_1", "d_reply_2"]
+
+    # 3. Explicit list with alias gmail_bulk_delete_draft
+    alias_res = await gmail_bulk_delete_draft(
+        gmail_client,
+        draft_ids=["d_custom_1", "d_custom_2"],
+    )
+    assert alias_res["success"] is True
+    assert alias_res["deleted_count"] == 2
+    assert "d_custom_1" in deleted_calls
+    assert "d_custom_2" in deleted_calls
+
+    # 4. Async execution
+    async_res = await gmail_bulk_delete_drafts(
+        gmail_client,
+        draft_ids=["d_async_1"],
+        run_async=True,
+    )
+    assert async_res["success"] is True
+    assert async_res["status"] == "RUNNING"
+    assert async_res["job_id"].startswith("job_delete_drafts_")
+
+    await asyncio.sleep(0.05)
+    job_status = await gmail_get_bulk_status(gmail_client, async_res["job_id"])
+    assert job_status["success"] is True
+    assert job_status["status"] == "COMPLETED"
+    assert job_status["sent"] == 1
+    assert "d_async_1" in deleted_calls
+
+
+@pytest.mark.asyncio()
+async def test_bulk_create_drafts_skips_bounced_threads(
+    gmail_client: GmailClientWrapper,
+) -> None:
+    """Verify gmail_bulk_create_drafts inspects reply threads and skips bounced threads by default."""
+    from gmail_mcp.tools.bulk_operations import gmail_bulk_create_drafts
+
+    created_threads: list[str] = []
+    orig_execute = gmail_client.execute_api
+
+    fake_threads = {
+        "th_clean": {
+            "id": "th_clean",
+            "messages": [
+                {
+                    "id": "m_clean",
+                    "threadId": "th_clean",
+                    "snippet": "Hello Alice, applying for ML role.",
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "Jay <jay@example.com>"},
+                            {"name": "To", "value": "alice@acme.com"},
+                            {"name": "Subject", "value": "Application at Acme"},
+                        ]
+                    },
+                }
+            ],
+        },
+        "th_mailer_daemon": {
+            "id": "th_mailer_daemon",
+            "messages": [
+                {"id": "m_b1_orig", "threadId": "th_mailer_daemon", "snippet": "Hello Bob", "payload": {"headers": []}},
+                {
+                    "id": "m_b1_dsn",
+                    "threadId": "th_mailer_daemon",
+                    "snippet": "Message blocked Your message to bob@ltimindtree.com has been blocked.",
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "Mail Delivery Subsystem <mailer-daemon@googlemail.com>"},
+                            {"name": "Subject", "value": "Delivery Status Notification (Failure)"},
+                        ]
+                    },
+                },
+            ],
+        },
+        "th_outlook_550": {
+            "id": "th_outlook_550",
+            "messages": [
+                {"id": "m_b2_orig", "threadId": "th_outlook_550", "snippet": "Hello Carol", "payload": {"headers": []}},
+                {
+                    "id": "m_b2_dsn",
+                    "threadId": "th_outlook_550",
+                    "snippet": "Remote server returned '550 5.1.1 User unknown' from protection.outlook.com",
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "postmaster@corp.com"},
+                            {"name": "Subject", "value": "Undeliverable: Application at Corp"},
+                        ]
+                    },
+                },
+            ],
+        },
+        "th_delay": {
+            "id": "th_delay",
+            "messages": [
+                {
+                    "id": "m_b3_dsn",
+                    "threadId": "th_delay",
+                    "snippet": "Delivery incomplete There was a temporary problem delivering your message.",
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "postmaster@other.com"},
+                            {"name": "Subject", "value": "Delivery Status Notification (Delay)"},
+                        ]
+                    },
+                },
+            ],
+        },
+    }
+
+    async def _mock_execute(endpoint, params=None, **kwargs):
+        if endpoint == "threads.get" and params and params.get("id") in fake_threads:
+            return fake_threads[params["id"]], {"quota_estimate": 40}
+        if endpoint == "messages.get" and params and params.get("id") == "m_b1_dsn":
+            return fake_threads["th_mailer_daemon"]["messages"][1], {"quota_estimate": 20}
+        if endpoint == "drafts.create" and params:
+            created_threads.append(params["body"]["message"].get("threadId", ""))
+        return await orig_execute(endpoint, params, **kwargs)
+
+    gmail_client.execute_api = _mock_execute  # type: ignore[method-assign]
+
+    recipients = [
+        {"to": "alice@acme.com", "thread_id": "th_clean", "subject": "Re: Application at Acme"},
+        {"to": "bob@ltimindtree.com", "thread_id": "th_mailer_daemon", "subject": "Re: Application at LTIMindtree"},
+        {"to": "carol@corp.com", "thread_id": "th_outlook_550", "subject": "Re: Application at Corp"},
+        {"to": "dave@other.com", "thread_id": "th_delay", "subject": "Re: Application at Other"},
+    ]
+
+    res = await gmail_bulk_create_drafts(
+        gmail_client,
+        recipients=recipients,
+        body_text="Following up!",
+        compact=False,
+        concurrency=2,
+    )
+    assert res["success"] is True, res
+    assert res["created"] == 1
+    assert res["skipped"] == 3
+    assert res["failed"] == 0
+    assert created_threads == ["th_clean"]
+    assert len(res["skipped_items"]) == 3
+    assert all(item["reason"] == "THREAD_BOUNCED" for item in res["skipped_items"])
+
+    # Verify skip_bounced=False bypasses the bounce check
+    created_threads.clear()
+    res_no_skip = await gmail_bulk_create_drafts(
+        gmail_client,
+        recipients=recipients[:2],
+        body_text="Following up!",
+        compact=True,
+        skip_bounced=False,
+    )
+    assert res_no_skip["success"] is True
+    assert res_no_skip["created"] == 2
+    assert res_no_skip["skipped"] == 0
+
+
+
+
 

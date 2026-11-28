@@ -328,6 +328,21 @@ class SendLedgerRepository:
                 "recipients_sent_24h": int(row["recipient_count"] or 0),
             }
 
+    def get_recent_send_timestamps(self, window_seconds: float = 3600.0) -> list[tuple[str, float]]:
+        """Return (recipient, epoch_seconds) for all sends in the rolling window, oldest first."""
+        cutoff = time.time() - window_seconds
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                """
+                SELECT recipient, epoch_seconds
+                FROM send_ledger
+                WHERE epoch_seconds >= ? AND status IN ('SENT', 'INDETERMINATE')
+                ORDER BY epoch_seconds ASC
+                """,
+                (cutoff,),
+            ).fetchall()
+            return [(str(r["recipient"] or ""), float(r["epoch_seconds"])) for r in rows]
+
     def list_by_plan_id(self, plan_id: str) -> list[SendLedgerRecord]:
         with self.db.transaction() as conn:
             rows = conn.execute(

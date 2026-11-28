@@ -261,8 +261,8 @@ QUOTA_COST_REGISTRY: dict[str, int] = {
 # Recommended application-level safeguard defaults (Section 7.D)
 GMAIL_CONFIG: dict[str, Any] = {
     "account_type": "personal",
-    "daily_send_soft_cap": 200,
-    "daily_send_hard_cap": 300,
+    "daily_send_soft_cap": 350,
+    "daily_send_hard_cap": 400,
     "send_concurrency": 1,
     "send_interval_seconds": 3,
     "read_concurrency": 3,
@@ -365,10 +365,21 @@ class GmailConfig(BaseModel):
     external_daily_send_ceiling: int = 500
     max_recipients_per_message: int = 500
     daily_send_soft_cap: int = Field(
-        default_factory=lambda: int(os.getenv("GMAIL_DAILY_SEND_SOFT_CAP", "200"))
+        default_factory=lambda: int(os.getenv("GMAIL_DAILY_SEND_SOFT_CAP", "350"))
     )
     daily_send_hard_cap: int = Field(
-        default_factory=lambda: int(os.getenv("GMAIL_DAILY_SEND_HARD_CAP", "300"))
+        default_factory=lambda: int(os.getenv("GMAIL_DAILY_SEND_HARD_CAP", "400"))
+    )
+
+    # Non-blocking anti-spam pacing defaults
+    non_blocking_max_per_hour: int = Field(
+        default_factory=lambda: int(os.getenv("GMAIL_NON_BLOCKING_MAX_PER_HOUR", "40"))
+    )
+    non_blocking_max_per_domain_per_hour: int = Field(
+        default_factory=lambda: int(os.getenv("GMAIL_NON_BLOCKING_MAX_PER_DOMAIN_PER_HOUR", "2"))
+    )
+    non_blocking_domain_window_seconds: float = Field(
+        default_factory=lambda: float(os.getenv("GMAIL_NON_BLOCKING_DOMAIN_WINDOW_SECONDS", "3600.0"))
     )
 
     # Concurrency & pacing

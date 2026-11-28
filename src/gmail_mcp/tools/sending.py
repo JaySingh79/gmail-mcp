@@ -13,11 +13,24 @@ from pathlib import Path
 from typing import Any
 
 from gmail_mcp.core.gmail_client import GmailClientWrapper
+from gmail_mcp.core.pacing import NonBlockingPacer, extract_domain
 from gmail_mcp.core.quota_manager import QuotaExhaustedError
 from gmail_mcp.core.retry_manager import GmailMCPError
 from gmail_mcp.core.safety import SafetyError
 from gmail_mcp.tools.drafts import resolve_content_or_template
 from gmail_mcp.tools.search import DEFAULT_METADATA_HEADERS
+
+
+def _build_pacer(client: GmailClientWrapper) -> NonBlockingPacer:
+    """Construct a NonBlockingPacer seeded with recent send_ledger timestamps."""
+    window = client.config.non_blocking_domain_window_seconds
+    history = client.send_ledger_repo.get_recent_send_timestamps(window_seconds=window)
+    return NonBlockingPacer(
+        max_per_hour=client.config.non_blocking_max_per_hour,
+        max_per_domain_per_hour=client.config.non_blocking_max_per_domain_per_hour,
+        window_seconds=window,
+        history=history,
+    )
 
 
 def _compute_default_idempotency_key(
@@ -860,6 +873,8 @@ async def gmail_execute_bulk_send(
     concurrency: int = 5,
     compact: bool = True,
     run_async: bool = False,
+    non_blocking_practice: bool = True,
+    _pacer: NonBlockingPacer | None = None,
 ) -> dict[str, Any]:
     """
     Phase 2 of two-phase bulk sending:
@@ -1054,34 +1069,65 @@ async def gmail_execute_bulk_send(
                             non_retryable_failures.append(fail_entry)
                         return fail_entry
 
-            # Process in chunks of `step` so rate limits and daily limits halt gracefully
-            for i in range(0, len(plan.items), step):
-                if stopped_error_code is not None:
-                    break
+            # Process in chunks of `step` (or paced via NonBlockingPacer when non_blocking_practice=True)
+            if non_blocking_practice:
+                pacer = _pacer or _build_pacer(client)
 
-                # Check headroom before launching next batch chunk
-                hd = client.quota_manager.get_sending_headroom(requested_messages=1, requested_recipients=1)
-                if hd.get("exhausted") or hd.get("remaining_allowed", 1) <= 0:
-                    stopped_error_code = "DAILY_SEND_LIMIT"
-                    stopped_error_message = "Daily send limit reached."
-                    resumable = True
-                    client.bulk_plan_repo.update_status(plan_id, "PAUSED_LIMIT_REACHED")
-                    break
-
-                chunk = plan.items[i : i + step]
-                chunk_results = await asyncio.gather(*[_send_one_item(item) for item in chunk], return_exceptions=True)
-                for cr in chunk_results:
+                async def _paced_send_one(item: dict[str, Any]) -> None:
+                    nonlocal stopped_error_code, stopped_error_message, resumable
+                    hd = client.quota_manager.get_sending_headroom(requested_messages=1, requested_recipients=1)
+                    if hd.get("exhausted") or hd.get("remaining_allowed", 1) <= 0:
+                        stopped_error_code = "DAILY_SEND_LIMIT"
+                        stopped_error_message = "Daily send limit reached."
+                        resumable = True
+                        client.bulk_plan_repo.update_status(plan_id, "PAUSED_LIMIT_REACHED")
+                        return
+                    cr = await _send_one_item(item)
                     if isinstance(cr, dict) and cr.get("status") != "skipped":
                         individual_results.append(cr)
+                    _update_bulk_job(
+                        job_id,
+                        processed=len(individual_results),
+                        sent=sent_count,
+                        failed=failed_count,
+                        skipped=skipped_already_sent,
+                        errors=non_retryable_failures + retryable_failures,
+                    )
 
-                _update_bulk_job(
-                    job_id,
-                    processed=len(individual_results),
-                    sent=sent_count,
-                    failed=failed_count,
-                    skipped=skipped_already_sent,
-                    errors=non_retryable_failures + retryable_failures,
+                await pacer.run_paced_queue(
+                    list(plan.items),
+                    domain_fn=lambda it: extract_domain(it.get("to")),
+                    send_fn=_paced_send_one,
+                    should_stop_fn=lambda: stopped_error_code is not None,
                 )
+            else:
+                for i in range(0, len(plan.items), step):
+                    if stopped_error_code is not None:
+                        break
+
+                    # Check headroom before launching next batch chunk
+                    hd = client.quota_manager.get_sending_headroom(requested_messages=1, requested_recipients=1)
+                    if hd.get("exhausted") or hd.get("remaining_allowed", 1) <= 0:
+                        stopped_error_code = "DAILY_SEND_LIMIT"
+                        stopped_error_message = "Daily send limit reached."
+                        resumable = True
+                        client.bulk_plan_repo.update_status(plan_id, "PAUSED_LIMIT_REACHED")
+                        break
+
+                    chunk = plan.items[i : i + step]
+                    chunk_results = await asyncio.gather(*[_send_one_item(item) for item in chunk], return_exceptions=True)
+                    for cr in chunk_results:
+                        if isinstance(cr, dict) and cr.get("status") != "skipped":
+                            individual_results.append(cr)
+
+                    _update_bulk_job(
+                        job_id,
+                        processed=len(individual_results),
+                        sent=sent_count,
+                        failed=failed_count,
+                        skipped=skipped_already_sent,
+                        errors=non_retryable_failures + retryable_failures,
+                    )
 
             remaining = max(0, requested - sent_count - failed_count)
 
@@ -1157,7 +1203,8 @@ async def gmail_execute_bulk_send(
                 res_out["compact"] = False
             return res_out
 
-        if run_async:
+        effective_async = run_async or (non_blocking_practice and _pacer is None and plan.requested_count > 2)
+        if effective_async:
             asyncio.create_task(_run_plan_execution())
             return {
                 "success": True,
@@ -1166,6 +1213,7 @@ async def gmail_execute_bulk_send(
                 "job_id": job_id,
                 "plan_id": plan_id,
                 "requested": plan.requested_count,
+                "non_blocking_practice": non_blocking_practice,
                 "message": "Bulk send execution started in background. Monitor status via gmail_get_bulk_status.",
             }
 
@@ -1179,6 +1227,7 @@ async def gmail_send_draft(
     draft_id: str,
     *,
     idempotency_key: str | None = None,
+    recipient: str | None = None,
 ) -> dict[str, Any]:
     """
     Send an existing Gmail draft by its draft_id using native Gmail API users.drafts.send.
@@ -1219,7 +1268,7 @@ async def gmail_send_draft(
             operation_id=f"op_{uuid.uuid4().hex[:12]}",
             idempotency_key=idem_key,
             operation_type="send_draft",
-            recipient="",
+            recipient=recipient or "",
             status="SENT",
             quota_cost=100,
             gmail_message_id=msg_id,
@@ -1243,6 +1292,30 @@ async def gmail_send_draft(
         return client.format_tool_error("gmail_send_draft", exc, mutates_mailbox=True)
 
 
+async def _resolve_draft_recipient(client: GmailClientWrapper, draft_id: str) -> str:
+    """Fetch draft metadata to extract the primary To/Cc/Bcc recipient string."""
+    try:
+        resp, _ = await client.execute_api(
+            "drafts.get",
+            {
+                "id": draft_id,
+                "format": "metadata",
+                "metadataHeaders": ["To", "Cc", "Bcc"],
+            },
+            tool_name="gmail_bulk_send_drafts",
+            op_class="read",
+            fmt="metadata",
+        )
+        msg = resp.get("message") or {}
+        headers = (msg.get("payload") or {}).get("headers") or []
+        for h in headers:
+            if str(h.get("name", "")).lower() == "to" and h.get("value"):
+                return str(h["value"])
+    except Exception:
+        pass
+    return ""
+
+
 async def gmail_bulk_send_drafts(
     client: GmailClientWrapper,
     draft_ids: list[str],
@@ -1250,10 +1323,13 @@ async def gmail_bulk_send_drafts(
     concurrency: int = 5,
     compact: bool = True,
     run_async: bool = False,
+    non_blocking_practice: bool = True,
+    _pacer: NonBlockingPacer | None = None,
 ) -> dict[str, Any]:
     """
     Send multiple existing Gmail drafts by draft_id in one call without rebuilding MIME or re-uploading PDFs.
-    Uses asynchronous concurrency bounded by a semaphore to prevent timeouts.
+    When `non_blocking_practice=True` (default), enforces max 40 emails/hour globally and max 2 emails/hour
+    per recipient domain with round-robin domain interleaving and randomized jitter.
     """
     try:
         if not draft_ids:
@@ -1269,21 +1345,46 @@ async def gmail_bulk_send_drafts(
             failed = 0
             results: list[dict[str, Any]] = []
             errors: list[dict[str, Any]] = []
+            stopped = False
 
-            async def _send_one(did: str):
-                nonlocal sent, failed
+            async def _send_one(did: str, recip_hint: str = ""):
+                nonlocal sent, failed, stopped
                 async with sem:
-                    res = await gmail_send_draft(client, did)
+                    res = await gmail_send_draft(client, did, recipient=recip_hint or None)
                     if res.get("success"):
                         sent += 1
                     else:
                         failed += 1
                         errors.append({"draft_id": did, "error": res.get("message")})
+                        if res.get("error_code") in (
+                            "DAILY_SEND_LIMIT",
+                            "QUOTA_EXHAUSTED",
+                            "USER_RATE_LIMIT_HEADROOM_EXCEEDED",
+                            "PROJECT_RATE_LIMIT_HEADROOM_EXCEEDED",
+                        ):
+                            stopped = True
                     results.append(res)
                     _update_bulk_job(job_id, processed=len(results), sent=sent, failed=failed, errors=errors)
                     return res
 
-            await asyncio.gather(*[_send_one(d) for d in draft_ids], return_exceptions=True)
+            if non_blocking_practice:
+                meta_sem = asyncio.Semaphore(10)
+
+                async def _lookup(did: str) -> tuple[str, str]:
+                    async with meta_sem:
+                        return did, await _resolve_draft_recipient(client, did)
+
+                draft_items = await asyncio.gather(*[_lookup(d) for d in draft_ids])
+                pacer = _pacer or _build_pacer(client)
+                await pacer.run_paced_queue(
+                    list(draft_items),
+                    domain_fn=lambda pair: extract_domain(pair[1]),
+                    send_fn=lambda pair: _send_one(pair[0], pair[1]),
+                    should_stop_fn=lambda: stopped,
+                )
+            else:
+                await asyncio.gather(*[_send_one(d) for d in draft_ids], return_exceptions=True)
+
             _update_bulk_job(
                 job_id,
                 status="COMPLETED" if failed == 0 else "PARTIAL_FAILURE",
@@ -1294,7 +1395,8 @@ async def gmail_bulk_send_drafts(
             )
             return {"sent": sent, "failed": failed, "results": results, "errors": errors}
 
-        if run_async:
+        effective_async = run_async or (non_blocking_practice and _pacer is None and count > 2)
+        if effective_async:
             asyncio.create_task(_run_sends())
             return {
                 "success": True,
@@ -1302,6 +1404,7 @@ async def gmail_bulk_send_drafts(
                 "status": "RUNNING",
                 "job_id": job_id,
                 "total": count,
+                "non_blocking_practice": non_blocking_practice,
                 "message": "Bulk draft sending started in background. Monitor via gmail_get_bulk_status.",
             }
 
@@ -1316,6 +1419,7 @@ async def gmail_bulk_send_drafts(
             "total": count,
             "sent": sent,
             "failed": failed,
+            "non_blocking_practice": non_blocking_practice,
             "quota_estimate": {"units_per_request": 100, "total_units": sent * 100},
         }
         if compact:
@@ -1498,10 +1602,14 @@ async def gmail_execute_bulk_reply(
     client: GmailClientWrapper,
     plan_id: str,
     confirmation_phrase: str,
+    *,
+    run_async: bool = False,
+    non_blocking_practice: bool = True,
+    _pacer: NonBlockingPacer | None = None,
 ) -> dict[str, Any]:
     """
     Phase 2 of two-phase bulk replies:
-    Verifies `plan_id`, `CONFIRM SEND <N> REPLIES`, and SHA-256 plan integrity,
+    Verifies `plan_id`, `CONFIRM_REPLY_<plan_id>`, and SHA-256 plan integrity,
     then sends each reply inside its respective thread with RFC threading headers.
     """
     try:
@@ -1541,152 +1649,205 @@ async def gmail_execute_bulk_reply(
             }
 
         client.bulk_plan_repo.update_status(plan_id, "EXECUTING")
+        job_id = f"job_reply_{uuid.uuid4().hex[:12]}"
+        _init_bulk_job(job_id, operation="bulk_reply", total=plan.requested_count, plan_id=plan_id)
 
-        requested = plan.requested_count
-        sent_count = 0
-        skipped_count = 0
-        failed_count = 0
-        total_units_consumed = 0
-        individual_results: list[dict[str, Any]] = []
-        retryable_failures: list[dict[str, Any]] = []
-        non_retryable_failures: list[dict[str, Any]] = []
-        stopped_error_code: str | None = None
-        stopped_error_message: str | None = None
+        async def _run_reply_execution() -> dict[str, Any]:
+            requested = plan.requested_count
+            sent_count = 0
+            skipped_count = 0
+            failed_count = 0
+            total_units_consumed = 0
+            individual_results: list[dict[str, Any]] = []
+            retryable_failures: list[dict[str, Any]] = []
+            non_retryable_failures: list[dict[str, Any]] = []
+            stopped_error_code: str | None = None
+            stopped_error_message: str | None = None
 
-        for item in plan.items:
-            idx = int(item["index"])
-            th_id = item["thread_id"]
-            primary_recip = ", ".join(item["to"])
-            idem_key = f"{plan_id}:reply:{idx}:{th_id}"
+            async def _reply_one(item: dict[str, Any]) -> None:
+                nonlocal sent_count, skipped_count, failed_count, total_units_consumed
+                nonlocal stopped_error_code, stopped_error_message
+                if stopped_error_code is not None:
+                    return
 
-            existing = client.send_ledger_repo.get_by_idempotency_key(idem_key)
-            if existing and existing.status in ("SENT", "INDETERMINATE"):
-                skipped_count += 1
-                sent_count += 1
-                individual_results.append(
-                    {
+                idx = int(item["index"])
+                th_id = item["thread_id"]
+                primary_recip = ", ".join(item["to"])
+                idem_key = f"{plan_id}:reply:{idx}:{th_id}"
+
+                existing = client.send_ledger_repo.get_by_idempotency_key(idem_key)
+                if existing and existing.status in ("SENT", "INDETERMINATE"):
+                    skipped_count += 1
+                    sent_count += 1
+                    individual_results.append(
+                        {
+                            "index": idx,
+                            "thread_id": th_id,
+                            "recipient": primary_recip,
+                            "message_id": existing.gmail_message_id,
+                            "status": "already_sent_skipped",
+                        }
+                    )
+                    return
+
+                try:
+                    built = client.mime_builder.build_email_message(
+                        to=item["to"],
+                        cc=item.get("cc"),
+                        bcc=item.get("bcc"),
+                        subject=item["subject"],
+                        body_text=item.get("body_text"),
+                        body_html=item.get("body_html"),
+                        in_reply_to=item.get("in_reply_to"),
+                        references=item.get("references"),
+                        attachments=item.get("attachments"),
+                    )
+                    resp, meta = await client.send_raw_mime_safely(
+                        raw_b64=built["raw"],
+                        rfc_message_id=built["rfc_message_id"],
+                        recipient_summary=primary_recip,
+                        operation_type="bulk_reply",
+                        idempotency_key=idem_key,
+                        tool_name="gmail_execute_bulk_reply",
+                        thread_id=th_id,
+                        cc_count=len(item.get("cc") or []),
+                        bcc_count=len(item.get("bcc") or []),
+                        total_recipient_count=int(item.get("total_recipient_count") or 1),
+                        plan_id=plan_id,
+                        attachment_bytes=built["raw_mime_size_bytes"],
+                    )
+                    total_units_consumed += int(meta.get("quota_estimate", 100))
+                    sent_count += 1
+                    individual_results.append(
+                        {
+                            "index": idx,
+                            "thread_id": resp.get("threadId") or th_id,
+                            "message_id": resp.get("id"),
+                            "recipient": primary_recip,
+                            "in_reply_to": item.get("in_reply_to"),
+                            "status": "sent",
+                        }
+                    )
+                except (QuotaExhaustedError, GmailMCPError, SafetyError) as item_exc:
+                    err_dict = client.format_tool_error("bulk_reply", item_exc, mutates_mailbox=True)
+                    err_code = err_dict["error_code"]
+                    if err_code in (
+                        "DAILY_SEND_LIMIT",
+                        "QUOTA_EXHAUSTED",
+                        "USER_RATE_LIMIT_HEADROOM_EXCEEDED",
+                        "PROJECT_RATE_LIMIT_HEADROOM_EXCEEDED",
+                    ):
+                        stopped_error_code = err_code
+                        stopped_error_message = err_dict["message"]
+                        client.bulk_plan_repo.update_status(plan_id, "PAUSED_LIMIT_REACHED")
+                        return
+
+                    failed_count += 1
+                    fail_entry = {
                         "index": idx,
                         "thread_id": th_id,
                         "recipient": primary_recip,
-                        "message_id": existing.gmail_message_id,
-                        "status": "already_sent_skipped",
+                        "status": "failed",
+                        "error_code": err_code,
+                        "message": err_dict["message"],
+                        "retryable": err_dict["retryable"],
                     }
-                )
-                continue
+                    individual_results.append(fail_entry)
+                    if err_dict["retryable"]:
+                        retryable_failures.append(fail_entry)
+                    else:
+                        non_retryable_failures.append(fail_entry)
 
-            try:
-                built = client.mime_builder.build_email_message(
-                    to=item["to"],
-                    cc=item.get("cc"),
-                    bcc=item.get("bcc"),
-                    subject=item["subject"],
-                    body_text=item.get("body_text"),
-                    body_html=item.get("body_html"),
-                    in_reply_to=item.get("in_reply_to"),
-                    references=item.get("references"),
-                    attachments=item.get("attachments"),
+                _update_bulk_job(
+                    job_id,
+                    processed=len(individual_results),
+                    sent=sent_count,
+                    failed=failed_count,
+                    skipped=skipped_count,
+                    errors=non_retryable_failures + retryable_failures,
                 )
-                resp, meta = await client.send_raw_mime_safely(
-                    raw_b64=built["raw"],
-                    rfc_message_id=built["rfc_message_id"],
-                    recipient_summary=primary_recip,
-                    operation_type="bulk_reply",
-                    idempotency_key=idem_key,
-                    tool_name="gmail_execute_bulk_reply",
-                    thread_id=th_id,
-                    cc_count=len(item.get("cc") or []),
-                    bcc_count=len(item.get("bcc") or []),
-                    total_recipient_count=int(item.get("total_recipient_count") or 1),
-                    plan_id=plan_id,
-                    attachment_bytes=built["raw_mime_size_bytes"],
-                )
-                total_units_consumed += int(meta.get("quota_estimate", 100))
-                sent_count += 1
-                individual_results.append(
-                    {
-                        "index": idx,
-                        "thread_id": resp.get("threadId") or th_id,
-                        "message_id": resp.get("id"),
-                        "recipient": primary_recip,
-                        "in_reply_to": item.get("in_reply_to"),
-                        "status": "sent",
-                    }
-                )
-            except (QuotaExhaustedError, GmailMCPError, SafetyError) as item_exc:
-                err_dict = client.format_tool_error("bulk_reply", item_exc, mutates_mailbox=True)
-                err_code = err_dict["error_code"]
-                if err_code in (
-                    "DAILY_SEND_LIMIT",
-                    "QUOTA_EXHAUSTED",
-                    "USER_RATE_LIMIT_HEADROOM_EXCEEDED",
-                    "PROJECT_RATE_LIMIT_HEADROOM_EXCEEDED",
-                ):
-                    stopped_error_code = err_code
-                    stopped_error_message = err_dict["message"]
-                    client.bulk_plan_repo.update_status(plan_id, "PAUSED_LIMIT_REACHED")
-                    break
 
-                failed_count += 1
-                fail_entry = {
-                    "index": idx,
-                    "thread_id": th_id,
-                    "recipient": primary_recip,
-                    "status": "failed",
-                    "error_code": err_code,
-                    "message": err_dict["message"],
-                    "retryable": err_dict["retryable"],
+            if non_blocking_practice:
+                pacer = _pacer or _build_pacer(client)
+                await pacer.run_paced_queue(
+                    list(plan.items),
+                    domain_fn=lambda it: extract_domain(it.get("to")),
+                    send_fn=_reply_one,
+                    should_stop_fn=lambda: stopped_error_code is not None,
+                )
+            else:
+                for item in plan.items:
+                    if stopped_error_code is not None:
+                        break
+                    await _reply_one(item)
+
+            remaining = max(0, requested - sent_count - failed_count)
+            if stopped_error_code is not None:
+                _update_bulk_job(job_id, status="PAUSED_LIMIT_REACHED")
+                return {
+                    "success": False,
+                    "operation": "bulk_reply",
+                    "mutates_mailbox": sent_count > 0,
+                    "plan_id": plan_id,
+                    "job_id": job_id,
+                    "error_code": stopped_error_code,
+                    "message": stopped_error_message,
+                    "requested": requested,
+                    "successful": sent_count,
+                    "sent": sent_count,
+                    "failed": failed_count,
+                    "skipped": skipped_count + remaining,
+                    "remaining": remaining,
+                    "resumable": True,
+                    "safe_to_continue": False,
+                    "non_blocking_practice": non_blocking_practice,
+                    "individual_results": individual_results,
+                    "retryable_failures": retryable_failures,
+                    "non_retryable_failures": non_retryable_failures,
+                    "quota_estimate": {"units_per_request": 100, "total_units": total_units_consumed},
                 }
-                individual_results.append(fail_entry)
-                if err_dict["retryable"]:
-                    retryable_failures.append(fail_entry)
-                else:
-                    non_retryable_failures.append(fail_entry)
 
-        remaining = max(0, requested - sent_count - failed_count)
-        if stopped_error_code is not None:
+            all_succeeded = (sent_count == requested and failed_count == 0)
+            final_status = "COMPLETED" if all_succeeded else "PARTIAL_FAILURE"
+            client.bulk_plan_repo.update_status(plan_id, final_status)
+            _update_bulk_job(job_id, status=final_status)
+
             return {
-                "success": False,
+                "success": all_succeeded,
                 "operation": "bulk_reply",
                 "mutates_mailbox": sent_count > 0,
                 "plan_id": plan_id,
-                "error_code": stopped_error_code,
-                "message": stopped_error_message,
+                "job_id": job_id,
+                "status": final_status,
                 "requested": requested,
                 "successful": sent_count,
                 "sent": sent_count,
                 "failed": failed_count,
-                "skipped": skipped_count + remaining,
+                "skipped": skipped_count,
                 "remaining": remaining,
-                "resumable": True,
-                "safe_to_continue": False,
+                "resumable": remaining > 0 or failed_count > 0,
+                "safe_to_continue": True,
+                "non_blocking_practice": non_blocking_practice,
                 "individual_results": individual_results,
                 "retryable_failures": retryable_failures,
                 "non_retryable_failures": non_retryable_failures,
                 "quota_estimate": {"units_per_request": 100, "total_units": total_units_consumed},
             }
 
-        all_succeeded = (sent_count == requested and failed_count == 0)
-        final_status = "COMPLETED" if all_succeeded else "PARTIAL_FAILURE"
-        client.bulk_plan_repo.update_status(plan_id, final_status)
+        effective_async = run_async or (non_blocking_practice and _pacer is None and plan.requested_count > 2)
+        if effective_async:
+            asyncio.create_task(_run_reply_execution())
+            return {
+                "success": True,
+                "operation": "bulk_reply",
+                "status": "RUNNING",
+                "job_id": job_id,
+                "plan_id": plan_id,
+                "requested": plan.requested_count,
+                "non_blocking_practice": non_blocking_practice,
+                "message": "Bulk reply execution started in background. Monitor status via gmail_get_bulk_status.",
+            }
 
-        return {
-            "success": all_succeeded,
-            "operation": "bulk_reply",
-            "mutates_mailbox": sent_count > 0,
-            "plan_id": plan_id,
-            "status": final_status,
-            "requested": requested,
-            "successful": sent_count,
-            "sent": sent_count,
-            "failed": failed_count,
-            "skipped": skipped_count,
-            "remaining": remaining,
-            "resumable": remaining > 0 or failed_count > 0,
-            "safe_to_continue": True,
-            "individual_results": individual_results,
-            "retryable_failures": retryable_failures,
-            "non_retryable_failures": non_retryable_failures,
-            "quota_estimate": {"units_per_request": 100, "total_units": total_units_consumed},
-        }
+        return await _run_reply_execution()
     except Exception as exc:
         return client.format_tool_error("bulk_reply", exc, mutates_mailbox=True)

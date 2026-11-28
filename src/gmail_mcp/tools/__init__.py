@@ -16,6 +16,8 @@ from gmail_mcp.tools.attachments import (
 from gmail_mcp.tools.bulk_operations import (
     gmail_bulk_attach_to_drafts,
     gmail_bulk_create_drafts,
+    gmail_bulk_delete_draft,
+    gmail_bulk_delete_drafts,
 )
 from gmail_mcp.tools.drafts import (
     gmail_create_draft,
@@ -95,6 +97,8 @@ __all__ = [
     "gmail_authenticate",
     "gmail_bulk_attach_to_drafts",
     "gmail_bulk_create_drafts",
+    "gmail_bulk_delete_draft",
+    "gmail_bulk_delete_drafts",
     "gmail_bulk_label_messages",
     "gmail_bulk_send_drafts",
     "gmail_cancel_scheduled_send",

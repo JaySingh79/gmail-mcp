@@ -8,7 +8,7 @@
 
 ## 1. Executive Summary & Architecture Overview
 
-`gmail_mcp` is an enterprise-grade Model Context Protocol (MCP) server exposing **61 specialized tools** to LLM agents (Claude Code, Google Antigravity, Cursor, etc.) for autonomous Gmail management.
+`gmail_mcp` is an enterprise-grade Model Context Protocol (MCP) server exposing **63 specialized tools** to LLM agents (Claude Code, Google Antigravity, Cursor, etc.) for autonomous Gmail management.
 
 ### Architectural Philosophy
 1. **High Safety & Recipient Guardrails**: Rate-limiting token buckets, daily quota accounting, and blocklists prevent runaway loops from spamming or exhausting API limits.
@@ -140,7 +140,7 @@ To prevent LLM context bloat and token waste, **consult this routing guide befor
 
 ### C. Tool Implementations (`src/gmail_mcp/tools/`)
 
-All 61 tools are categorized across 14 dedicated modules:
+All 63 tools are categorized across 14 dedicated modules:
 
 | Module File | Exposed Tools | Description |
 | :--- | :--- | :--- |
@@ -151,7 +151,7 @@ All 61 tools are categorized across 14 dedicated modules:
 | [`tools/search.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/search.py) | `gmail_search_messages`<br>`gmail_search_threads` | Executes Gmail search queries (`from:`, `has:attachment`, `after:`, `is:unread`) across messages/threads. |
 | [`tools/drafts.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/drafts.py) | `gmail_create_draft`<br>`gmail_get_draft`<br>`gmail_list_drafts`<br>`gmail_update_draft`<br>`gmail_delete_draft`<br>`gmail_duplicate_draft` | Full lifecycle management of Gmail drafts (create, view, edit, duplicate, remove). |
 | [`tools/sending.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/sending.py) | `gmail_send_draft`<br>`gmail_send_email`<br>`gmail_send_reply`<br>`gmail_send_reply_all`<br>`gmail_forward_message`<br>`gmail_prepare_bulk_send`<br>`gmail_execute_bulk_send`<br>`gmail_bulk_send_drafts`<br>`gmail_get_bulk_status` | Primary outbound sending tools, draft dispatches, background jobs, and two-phase bulk campaigns. |
-| [`tools/bulk_operations.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/bulk_operations.py) | `gmail_bulk_create_drafts`<br>`gmail_bulk_attach_to_drafts`<br>`gmail_prepare_bulk_reply`<br>`gmail_execute_bulk_reply` | Bulk draft creation from scraped leads/JSON, bulk draft attachment injection, and bulk reply workflows. |
+| [`tools/bulk_operations.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/bulk_operations.py) | `gmail_bulk_create_drafts`<br>`gmail_bulk_attach_to_drafts`<br>`gmail_bulk_delete_drafts`<br>`gmail_bulk_delete_draft`<br>`gmail_prepare_bulk_reply`<br>`gmail_execute_bulk_reply` | Bulk draft creation from scraped leads/JSON, bulk draft attachment injection, bulk draft deletion, and bulk reply workflows. |
 | [`tools/attachments.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/attachments.py) | `gmail_get_attachment`<br>`gmail_list_attachments`<br>`gmail_attach_files_to_message` | Downloads attachments to disk, lists parts of an email, and attaches local files to existing drafts. |
 | [`tools/labels.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/labels.py) | `gmail_list_labels`<br>`gmail_create_label`<br>`gmail_update_label`<br>`gmail_delete_label`<br>`gmail_apply_label`<br>`gmail_remove_label` | Full management of user labels (create, rename, delete, apply, remove from messages). |
 | [`tools/filters.py`](file:///D:/Projects/gmail_mcp/src/gmail_mcp/tools/filters.py) | `gmail_list_filters`<br>`gmail_get_filter`<br>`gmail_create_filter`<br>`gmail_delete_filter` | Manages automated inbox filters (criteria: from, subject; actions: archive, label, star). |
@@ -235,3 +235,73 @@ uv --directory "D:\Projects\gmail_mcp" run pytest tests/integration/test_mcp_pro
 # Re-authenticate if token expires or scopes change
 uv --directory "D:\Projects\gmail_mcp" run python -m gmail_mcp.auth.oauth --login
 ```
+
+
+
+<!-- codebase-memory-mcp:start -->
+# Codebase Memory
+
+## Codebase Knowledge Graph (codebase-memory-mcp)
+
+This project uses codebase-memory-mcp to maintain a knowledge graph of the codebase.
+**ALWAYS** prefer **MCP graph tools over grep/glob/file-search for code discovery**.
+
+### Priority Order
+1. `search_graph` — find functions, classes, routes, variables by pattern
+2. `trace_path` — trace who calls a function or what it calls
+3. `get_code_snippet` — read specific function/class source code
+4. `check_index_coverage` — validate candidate paths and missed ranges before claims
+5. `query_graph` — run Cypher queries for complex patterns
+6. `get_architecture` — high-level project summary
+
+### Evidence tiers
+- **Scout (Tier 1):** quick positive lookup with few calls and targeted source checks. Mark it provisional; do not make negative or exhaustive claims.
+- **Verify (Tier 2, default):** task-directed graph evidence, relevant trace directions, exact snippets for material claims, and relevant pagination.
+- **Auditor (Tier 3):** bounded-scope full verification with current generation, complete relevant pagination, both call directions and broader relationships when material, and every limitation disclosed.
+- After candidate paths are known in any tier, call `check_index_coverage` once with every evidence path. Add relevant scopes for negative or exhaustive claims. A clean result means no recorded gap, not proof of completeness. For partial, skipped, excluded, stale, pending, or unknown coverage, read/grep the reported ranges or scope before relying on graph results.
+
+### When to fall back to grep/glob
+- Searching for string literals, error messages, config values
+- Searching non-code files (Dockerfiles, shell scripts, configs)
+- When MCP tools return insufficient results
+
+### Examples
+- Find a handler: `search_graph(name_pattern=".*OrderHandler.*")`
+- Who calls it: `trace_path(function_name="OrderHandler", direction="inbound")`
+- Read source: `get_code_snippet(qualified_name="pkg/orders.OrderHandler")`
+
+### Session resets and subagents
+- At session start or after compaction, confirm the nearest graph project and generation with `list_projects` or `index_status`, then choose Scout, Verify, or Auditor.
+- The graph project is the `list_projects` entry whose `root_path` contains your working directory; pass its `name` (or the absolute directory itself) as `project`, never a repo or folder name.
+- Before spawning a subagent, query the graph and coverage in the parent. Pass the tier, project, generation/freshness, bounded scope, queries and pagination state, qualified symbols, paths, call-chain findings, coverage evidence with ranges/reasons, source fallback already performed, and unresolved questions in the delegated task context.
+- Do not assume subagents inherit MCP access or the parent conversation. If a child lacks MCP tools, it must not call or claim MCP access. It should use the supplied evidence and read/grep exact source, especially every reported missed-coverage range.
+<!-- codebase-memory-mcp:end -->
+
+## 5. Fast Codebase Search (`ripgrep` / `rg`)
+Use `rg` (skill: `ripgrep`) for fast, `.gitignore`-aware codebase searching when locating string literals, error messages, config values, non-code files, or regexes (use `codebase-memory-mcp` first for symbol/call-graph discovery when indexed):
+- **Locate files / count hits first (save context):**
+  - `rg -l "pattern"` — list matching file paths only
+  - `rg -c "pattern"` — match count per file
+  - `rg --files -t py` — list searchable files by type (faster than `find` / `Get-ChildItem`)
+- **Everyday code search:**
+  - `rg -F "literal("` — fixed-string search (no regex escaping needed)
+  - `rg -S "Pattern"` — smart-case (case-insensitive unless uppercase is used)
+  - `rg -w "symbol"` — whole-word match
+  - `rg -C 3 "pattern"` — show 3 lines of surrounding context
+- **Filter by language or glob:**
+  - `rg "def foo" -t py` / `rg "TODO" -T json -T md` — include (`-t`) or exclude (`-T`) file types
+  - `rg "key" -g "*.toml" -g "!*.lock"` — include/exclude globs (single-quote in PowerShell)
+- **Context safety & hidden/ignored files:**
+  - `rg -M 200 --max-columns-preview "pattern"` — truncate long/minified lines
+  - `rg -u "pattern"` / `rg -uu "pattern"` — include `.gitignore`d (`-u`) or hidden (`-uu`, e.g. `.github/`) files
+  - `rg -U "a.*\nb"` — multiline search; `rg -- "--flag"` — search patterns starting with `-`
+
+<!-- mcp-instructions:start -->
+## Auto-Linked MCP Server Instructions
+<!-- Auto-synced by ~/.gemini/scripts/sync_mcp_instructions.py on SessionStart -->
+- @codebase-memory-mcp: [codebase-memory-mcp/instructions.md](file:///C:/Users/binit/.gemini/mcp-instructions/codebase-memory-mcp.md)
+- @firecrawl: [firecrawl/instructions.md](file:///C:/Users/binit/.gemini/mcp-instructions/firecrawl.md)
+- @github: [github/instructions.md](file:///C:/Users/binit/.gemini/mcp-instructions/github.md)
+- @gmail: [gmail/instructions.md](file:///C:/Users/binit/.gemini/mcp-instructions/gmail.md)
+- @job-automation_gmail: [job-automation_gmail/instructions.md](file:///C:/Users/binit/.gemini/mcp-instructions/job-automation_gmail.md)
+<!-- mcp-instructions:end -->

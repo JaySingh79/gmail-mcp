@@ -40,6 +40,8 @@ MANDATORY_TOOLS = {
     "gmail_delete_draft",
     "gmail_bulk_create_drafts",
     "gmail_bulk_attach_to_drafts",
+    "gmail_bulk_delete_draft",
+    "gmail_bulk_delete_drafts",
     # D. Sending & replies
     "gmail_send_draft",
     "gmail_send_email",
