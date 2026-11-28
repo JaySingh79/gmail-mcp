@@ -6,11 +6,15 @@ A modular, quota-aware Model Context Protocol (MCP) server for personal and Work
 
 ## Key Capabilities
 
-- **57 MCP Tools across 10 Domains**: Account diagnostics, low-latency server-side search, threads, drafts, MIME-preserving draft duplication (`1..100+`), bulk personalized draft creation (`100+`), bulk draft attachments (`100+`), single & two-phase confirmed bulk sending (`CONFIRM SEND N EMAILS`), threaded bulk replies (`CONFIRM SEND N REPLIES`), SQLite templates with HTML escaping, labels (`batchModify` up to 1,000 messages), filters, mailbox organization, persistent SQLite scheduled sending, incremental History API synchronization, and JSON/CSV/EML exports.
+- **63 MCP Tools across 14 Modules**: Account diagnostics, low-latency server-side search, threads, drafts, MIME-preserving draft duplication (`1..100+`), parallel bulk personalized draft creation (`concurrency` default 10, max 25), bulk draft attachments (`100+`), bulk draft deletion, bulk reply drafting (bounced threads auto-skipped), single & two-phase confirmed bulk sending (`CONFIRM SEND N EMAILS`), threaded bulk replies (`CONFIRM SEND N REPLIES`), SQLite templates with HTML escaping, labels (`batchModify` up to 1,000 messages), filters, mailbox organization, persistent SQLite scheduled sending, incremental History API synchronization, and JSON/CSV/EML exports.
 - **Official Gmail REST API v1**: Uses `google-api-python-client` directly; zero dependency on `gmailmcp.googleapis.com` or Google Workspace admin APIs.
 - **Centralized Quota & Rate-Limit Protection**:
   - Enforces per-user (`6,000` units/min standard, `4,800` effective with 20% safety margin) and per-project (`1,200,000` units/min) weighted token buckets backed by SQLite.
-  - Enforces conservative personal Gmail sending safeguards (`daily_send_soft_cap=200`, `daily_send_hard_cap=300` vs external `500/day` Google account limit) and reconciles against `in:sent`.
+  - Enforces conservative personal Gmail sending safeguards (`daily_send_soft_cap=350`, `daily_send_hard_cap=400` vs external `500/day` Google account limit) and reconciles against `in:sent`.
+  - **Non-blocking anti-spam pacing** (`core/pacing.py`): sends are spread across the day (`GMAIL_NON_BLOCKING_MAX_PER_HOUR=40`), limited per recipient domain (`GMAIL_NON_BLOCKING_MAX_PER_DOMAIN_PER_HOUR=2`), and interleaved round-robin by domain.
+- **Universal Attachment Paths**: Attach files from any directory/drive (`GMAIL_ALLOW_ANY_ATTACHMENT_DIR`, default `true`); relative paths resolve from the CWD/workspace.
+- **Singleton Server Lock** (`core/lock.py`): OS-level file lock + `.pid` file prevents duplicate server processes.
+- **Self-Healing Auth**: `gmail_authenticate` tool, automatic OAuth callback port detection, auto-discovery of credentials/token paths (`GMAIL_CONFIG_DIR`, `GMAIL_CREDENTIALS_PATH`, `GMAIL_TOKEN_PATH`).
 - **Ambiguous Send Timeout Reconciliation**:
   - Assigns deterministic RFC-2822 `Message-ID` headers (`<...@gmail-mcp.local>`) before sending and reconciles via `rfc822msgid:` search after any timeout — **never blindly resends** an email after an ambiguous timeout.
 
@@ -31,6 +35,8 @@ gmail_mcp/
 │   │   ├── gmail_client.py    # Shared dependency-injected GmailClientWrapper
 │   │   ├── quota_manager.py   # Method unit costs, rolling windows & 24h send headroom
 │   │   ├── rate_limiter.py    # Weighted token buckets & read/write/send concurrency
+│   │   ├── pacing.py          # Anti-spam hourly/per-domain pacing & domain interleaving
+│   │   ├── lock.py            # Singleton server file lock (msvcrt/fcntl) & pid tracking
 │   │   ├── retry_manager.py   # HTTP 400/401/403/404/429/5xx classifier & send reconciler
 │   │   ├── mime_builder.py    # EmailMessage builder, raw MIME parser & reconstructor
 │   │   ├── pagination.py      # Server-side query builder & nextPageToken collector
@@ -47,7 +53,7 @@ gmail_mcp/
 │       ├── messages.py        # Get individual message (minimal, metadata, full, raw)
 │       ├── threads.py         # Get full conversation thread
 │       ├── drafts.py          # Create, get, list, duplicate, update, delete drafts
-│       ├── bulk_operations.py # Bulk create 100+ drafts & bulk attach files to 100+ drafts
+│       ├── bulk_operations.py # Parallel bulk create/attach/delete drafts & 2-phase bulk reply
 │       ├── sending.py         # Single send, reply, reply-all, forward, 2-phase bulk send/reply
 │       ├── templates.py       # SQLite templates CRUD, versioning & HTML-safe preview
 │       ├── attachments.py     # List attachments, download attachments, build MIME attachments
@@ -71,6 +77,11 @@ gmail_mcp/
 ├── pyproject.toml             # Package metadata, dependencies, scripts, pytest configuration
 ├── requirements.txt           # Standard pip requirements
 ├── main.py                    # Direct CLI execution script
+├── run_server.bat             # Windows stdio server launcher
+├── GEMINI.md                  # Agent architecture & tool routing guide
+├── improvements.md            # Improvement notes
+├── scripts/                   # Mailbox/template inspection helpers
+├── skills/                    # Agent skills (outreach templates, RCA)
 └── .env.example               # Template environment configuration
 ```
 
@@ -147,7 +158,7 @@ pytest tests -v
 
 ## Documentation
 
-- [`TOOL_REFERENCE.md`](docs/TOOL_REFERENCE.md) — Exhaustive specification for all 57 tools and 17 concrete sample invocations.
+- [`TOOL_REFERENCE.md`](docs/TOOL_REFERENCE.md) — Exhaustive specification for all 63 tools and 17 concrete sample invocations.
 - [`AUTHENTICATION.md`](docs/AUTHENTICATION.md) — Personal Gmail OAuth 2.0 setup, scope reference, and token lifecycle.
 - [`RATE_LIMITS.md`](docs/RATE_LIMITS.md) — Quota model, unit costs, and daily sending safeguards.
 - [`EXAMPLES.md`](docs/EXAMPLES.md) — Multi-step automation recipes (outreach, triage, sync).
